@@ -1,5 +1,13 @@
 # Troubleshooting
 
+**Windows protected your PC (SmartScreen)**
+Releases are not code-signed yet. Choose **More info → Run anyway**, or build from source.
+Compare the zip against `SHA256SUMS.txt` on the release page: `Get-FileHash RepoPulse-*.zip`.
+
+**"Repo Pulse core did not finish" / nothing happens after unzipping**
+Keep `repopulse.py` next to `RepoPulse.exe`, and unzip to a folder you can write to (not `Program Files`),
+because settings are saved in `data\` beside the program.
+
 **"Python 3.10 or newer was not found"**
 Install Python from python.org with the Python launcher (`py`). The Microsoft Store alias (`WindowsApps\python.exe`) is not used.
 
@@ -11,6 +19,14 @@ Hover over the summary line to see which folders were searched and how each repo
 If ⚙ settings list specific folders, only those (plus Claude Code / Codex / VS Code history and
 worktrees) are searched; clear the field to scan every fixed drive. Network and removable drives,
 and folders deeper than 6 levels below a root, are not walked; add them as roots.
+
+**Too many repositories, or ones you don't care about**
+List them under "Folders to skip" in ⚙ settings (or `scan --exclude`). Skipped folders and everything
+inside them are never searched or shown, even when an editor remembers them.
+
+**A clean, pushed worktree shows Review instead of Safe**
+It holds ignored files such as `.env` or local config, which `git worktree remove` would delete with no
+copy anywhere else. Hover the item to see which files. Move what you need, or select it knowingly.
 
 **A repo shows "Not a readable git repository"**
 Usually git's ownership check. Run `git config --global --add safe.directory <path>` if you trust that folder.

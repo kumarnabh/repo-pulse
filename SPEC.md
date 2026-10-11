@@ -26,7 +26,7 @@ automatic cleanup, anything requiring administrator rights.
 Core commands:
 
 ```
-repopulse.py scan    --roots "D:\Code;C:\Users\me\source" [--fetch] [--caches]
+repopulse.py scan    --roots "D:\Code;C:\Users\me\source" [--exclude "D:\Code\old"] [--fetch] [--caches] [--no-hints] [--text]
 repopulse.py backup  --repo PATH [--dest DIR]
 repopulse.py sync    --repo PATH [--push]
 repopulse.py clean   --repo PATH --ids ID1,ID2 [--allow-review] [--dest DIR]
@@ -34,7 +34,9 @@ repopulse.py clean   --repo PATH --ids ID1,ID2 [--allow-review] [--dest DIR]
 
 `scan` never changes anything, except `--fetch`, which runs
 `git fetch --prune --no-tags origin` on every main repository before scanning (it updates only
-remote-tracking refs). `--no-hints` skips tool-history discovery.
+remote-tracking refs; repositories without a remote are skipped, not reported as failures).
+`--no-hints` skips tool-history discovery. `--exclude` lists folders that are never walked or reported.
+`--text` prints a readable report instead of JSON.
 
 ## Widget layout
 
@@ -77,7 +79,10 @@ before execution; if an item changed since the scan, it is skipped.
 
 ### Worktrees
 - **Safe**: the directory is already missing (prunable metadata) → `git worktree prune`.
-- **Safe**: clean, not locked, and its HEAD is contained in a remote, with a fresh fetch.
+- **Safe**: clean, not locked, its HEAD is contained in a remote, with a fresh fetch, and it holds
+  no ignored files other than rebuildable folders from the folder rules below.
+- **Review**: as Safe, but it holds other ignored files (`.env`, local config, data). `git worktree
+  remove` deletes ignored files without asking, and these exist nowhere else.
 - **Keep**: dirty, locked, the main worktree, or HEAD has unpushed commits.
 - Removal uses `git worktree remove` without `--force`, so git itself refuses
   dirty trees as a second guard.
@@ -102,8 +107,12 @@ before execution; if an item changed since the scan, it is skipped.
 Writes to `%USERPROFILE%\RepoPulse Backups\<repo>\<timestamp>\`:
 - every modified, staged and untracked (non-ignored) file, at its relative path;
 - `changes.patch` (`git diff HEAD --binary`) and `staged.patch`;
-- `unpushed.bundle` containing commits on no remote (skipped when there are none);
-- `manifest.json` with branch, HEAD, file list and restore instructions.
+- `unpushed.bundle` containing commits on no remote and the newest stash (skipped when there are none);
+- `stash-N.patch` for every stash entry (`stash-0` is the newest), including untracked files on git 2.32+;
+- `manifest.json` with branch, HEAD, file list, files that could not be copied, and restore instructions.
+
+A file that cannot be read (for example locked by another program) is listed in `failed`; the rest
+of the backup continues.
 
 The working tree is not modified.
 
@@ -123,8 +132,12 @@ Three sources, merged and de-duplicated by real path:
    and dependency folders. With no roots configured, every fixed drive is a root on Windows
    (the home folder elsewhere). Network and removable drives are never walked.
 2. **Tool history**: folders recorded by Claude Code (`~/.claude.json` projects), Codex
-   (`~/.codex/config.toml` projects) and VS Code / Cursor / Windsurf (`storage.json` workspace URIs).
-   Each path is resolved to its enclosing repository. Disable with `--no-hints`.
+   (`~/.codex/config.toml` projects), VS Code / Cursor / Windsurf (`storage.json` workspace URIs and
+   the recently opened list in `state.vscdb`, opened read-only) and JetBrains IDEs
+   (`options/recentProjects.xml`). Each existing path is resolved to its enclosing repository; paths
+   that no longer exist are ignored. Disable with `--no-hints`.
+
+Excluded folders (`--exclude`) apply to all three sources.
 3. **Worktree lists**: every linked worktree of every found repository, wherever it lives
    (for example `~/.codex/worktrees` or `.claude/worktrees`).
 

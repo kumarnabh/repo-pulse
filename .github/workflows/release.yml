@@ -1,0 +1,73 @@
+name: Release
+
+# Push a tag like v0.3.0 to publish a GitHub release with ready-to-run Windows builds.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Check the tag matches the version
+        shell: python
+        run: |
+          import os, re, sys
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          core = re.search(r'^VERSION = "(.+?)"', open("repopulse.py", encoding="utf-8").read(), re.M).group(1)
+          proj = re.search(r"<Version>(.+?)</Version>", open("source/RepoPulse.csproj", encoding="utf-8").read()).group(1)
+          if not tag == core == proj:
+              sys.exit(f"::error::tag {tag}, repopulse.py {core}, RepoPulse.csproj {proj} must all match")
+
+      - name: Core tests
+        run: python -m unittest discover -s tests
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $v = $env:GITHUB_REF_NAME.TrimStart('v')
+          $common = @('source/RepoPulse.csproj', '-c', 'Release', '-r', 'win-x64', '--nologo', '-p:PublishSingleFile=true', '-p:DebugType=none')
+          dotnet publish @common --self-contained true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o out/full
+          dotnet publish @common --self-contained false -o out/small
+          foreach ($kind in 'full', 'small') {
+            $name = if ($kind -eq 'full') { "RepoPulse-$v-win-x64" } else { "RepoPulse-$v-win-x64-needs-dotnet8" }
+            $dir = "dist/$name"
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            Copy-Item "out/$kind/RepoPulse.exe", repopulse.py, 'Launch Repo Pulse.cmd', README.md, CHANGELOG.md, TROUBLESHOOTING.md, LICENSE -Destination $dir
+            Compress-Archive -Path $dir -DestinationPath "dist/$name.zip"
+          }
+          Get-ChildItem dist/*.zip | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), $_.Name } | Set-Content dist/SHA256SUMS.txt
+          Get-Content dist/SHA256SUMS.txt
+
+      - name: Release notes from CHANGELOG.md
+        shell: python
+        run: |
+          import os, re
+          v = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(rf"^## {re.escape(v)}\b.*?$(.*?)(?=^## |\Z)", text, re.M | re.S)
+          notes = (m.group(1).strip() if m else f"See CHANGELOG.md for {v}.")
+          notes += ("\n\n### Download\n"
+                    f"- **RepoPulse-{v}-win-x64.zip**: everything included; needs only Python 3.10+.\n"
+                    f"- **RepoPulse-{v}-win-x64-needs-dotnet8.zip**: small download for machines with the .NET 8 Desktop Runtime.\n\n"
+                    "Unzip, then run `Launch Repo Pulse.cmd`. Verify downloads with `SHA256SUMS.txt`.")
+          open("notes.md", "w", encoding="utf-8").write(notes)
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $assets = @(Get-ChildItem dist/*.zip | ForEach-Object FullName) + 'dist/SHA256SUMS.txt'
+          gh release create $env:GITHUB_REF_NAME @assets --title "Repo Pulse $env:GITHUB_REF_NAME" --notes-file notes.md --verify-tag

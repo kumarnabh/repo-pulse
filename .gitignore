@@ -1,4 +1,7 @@
 build/
+dist/
+out/
+notes.md
 source/bin/
 source/obj/
 data/
