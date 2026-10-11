@@ -29,7 +29,7 @@ repositories, clones and AI-agent worktrees. Sibling of [Prism](https://github.c
 2. Download **`RepoPulse-<version>-win-x64.zip`** from the [latest release](https://github.com/kumarnabh/repo-pulse/releases/latest) and unzip it anywhere you can write to (for example `%USERPROFILE%\Apps\RepoPulse`).
 3. Run **`Launch Repo Pulse.cmd`**.
 
-Already have the .NET 8 Desktop Runtime? The `…-needs-dotnet8.zip` download is about 200 KB instead of about 65 MB.
+Already have the .NET 10 Desktop Runtime? The `…-needs-dotnet10.zip` download is about 200 KB instead of about 65 MB.
 Releases are not code-signed yet, so Windows SmartScreen may ask you to confirm the first launch
 (**More info → Run anyway**). Each release lists SHA-256 checksums in `SHA256SUMS.txt`.
 
@@ -79,7 +79,7 @@ Tool-history files (`~/.claude.json`, Codex and editor state) are only read, nev
 
 ## Build from source
 
-Needs Python 3.10+ and the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
+Needs Python 3.10+ and the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 
 ```
 git clone https://github.com/kumarnabh/repo-pulse.git
@@ -92,7 +92,7 @@ Build.cmd
 | Path | Purpose |
 |---|---|
 | `repopulse.py` | Core: discovery, scan, classification, backup, sync, cleanup. Standard library only. |
-| `source/` | .NET 8 WPF widget (code-only, no XAML) that calls the core and renders its JSON. |
+| `source/` | .NET 10 WPF widget (code-only, no XAML) that calls the core and renders its JSON. |
 | `tests/` | Fixture tests with real git repositories. |
 | `.github/workflows/` | CI on Windows, Linux and macOS; tagged releases build the downloads. |
 

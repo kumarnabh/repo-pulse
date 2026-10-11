@@ -2,8 +2,8 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
 
-if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
-    throw 'The .NET 8 SDK is required to build. Install it from https://dotnet.microsoft.com/download/dotnet/8.0 and run Build again.'
+if (-not (Get-Command dotnet -ErrorAction SilentlyContinue) -or -not (dotnet --list-sdks | Select-String '^10\.')) {
+    throw 'The .NET 10 SDK is required to build. Install it from https://dotnet.microsoft.com/download/dotnet/10.0 (or: winget install Microsoft.DotNet.SDK.10) and run Build again.'
 }
 $python = $null
 foreach ($c in @('py', 'python')) {

@@ -3,6 +3,13 @@
 All notable changes. Versions follow [semantic versioning](https://semver.org/); releases are on
 [GitHub](https://github.com/kumarnabh/repo-pulse/releases).
 
+## 0.4.0 — 2026-10-11
+
+### Platform
+- The widget now runs on **.NET 10** (LTS, supported until November 2028). .NET 8 support ends on November 10, 2026.
+- The small download is now `…-needs-dotnet10.zip` and needs the .NET 10 Desktop Runtime. The full download still needs only Python.
+- Building from source needs the .NET 10 SDK; `Build.cmd` says so if it is missing.
+
 ## 0.3.0 — 2026-10-11
 
 First public release, with ready-to-run downloads.

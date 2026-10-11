@@ -12,7 +12,7 @@ because settings are saved in `data\` beside the program.
 Install Python from python.org with the Python launcher (`py`). The Microsoft Store alias (`WindowsApps\python.exe`) is not used.
 
 **Build fails: `dotnet` not found**
-Install the .NET 8 SDK, open a new terminal, run `Build.cmd` again.
+Install the .NET 10 SDK (`winget install Microsoft.DotNet.SDK.10`), open a new terminal, run `Build.cmd` again.
 
 **A repository is missing**
 Hover over the summary line to see which folders were searched and how each repository was found.

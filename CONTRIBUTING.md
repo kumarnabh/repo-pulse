@@ -24,7 +24,7 @@ Please do not paste private paths or file contents you would not want public.
   python -m unittest discover -s tests -v
   ```
 
-- The widget (`source/`) is code-only WPF on .NET 8. `Build.cmd` builds it; keep it free of warnings.
+- The widget (`source/`) is code-only WPF on .NET 10. `Build.cmd` builds it; keep it free of warnings.
 
 ## Releasing (maintainers)
 

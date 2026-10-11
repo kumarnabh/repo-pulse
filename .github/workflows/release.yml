@@ -18,7 +18,7 @@ jobs:
           python-version: "3.12"
       - uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: "8.0.x"
+          dotnet-version: "10.0.x"
 
       - name: Check the tag matches the version
         shell: python
@@ -41,7 +41,7 @@ jobs:
           dotnet publish @common --self-contained true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o out/full
           dotnet publish @common --self-contained false -o out/small
           foreach ($kind in 'full', 'small') {
-            $name = if ($kind -eq 'full') { "RepoPulse-$v-win-x64" } else { "RepoPulse-$v-win-x64-needs-dotnet8" }
+            $name = if ($kind -eq 'full') { "RepoPulse-$v-win-x64" } else { "RepoPulse-$v-win-x64-needs-dotnet10" }
             $dir = "dist/$name"
             New-Item -ItemType Directory -Force $dir | Out-Null
             Copy-Item "out/$kind/RepoPulse.exe", repopulse.py, 'Launch Repo Pulse.cmd', README.md, CHANGELOG.md, TROUBLESHOOTING.md, LICENSE -Destination $dir
@@ -60,7 +60,7 @@ jobs:
           notes = (m.group(1).strip() if m else f"See CHANGELOG.md for {v}.")
           notes += ("\n\n### Download\n"
                     f"- **RepoPulse-{v}-win-x64.zip**: everything included; needs only Python 3.10+.\n"
-                    f"- **RepoPulse-{v}-win-x64-needs-dotnet8.zip**: small download for machines with the .NET 8 Desktop Runtime.\n\n"
+                    f"- **RepoPulse-{v}-win-x64-needs-dotnet10.zip**: small download for machines with the .NET 10 Desktop Runtime.\n\n"
                     "Unzip, then run `Launch Repo Pulse.cmd`. Verify downloads with `SHA256SUMS.txt`.")
           open("notes.md", "w", encoding="utf-8").write(notes)
 

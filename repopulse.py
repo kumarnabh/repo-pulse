@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 IS_WIN = os.name == "nt"
 FRESH_HOURS = 24
 GC_THRESHOLD = 50 * 1024 * 1024

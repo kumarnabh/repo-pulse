@@ -1,7 +1,7 @@
 # Repo Pulse — Specification
 
 Local git health and space manager for Windows. Same architecture as Prism:
-a .NET 8 WPF glass shell that calls a Python core which prints JSON.
+a .NET 10 WPF glass shell that calls a Python core which prints JSON.
 
 ## Goals
 
