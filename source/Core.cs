@@ -9,8 +9,12 @@ namespace RepoPulse;
 public sealed class Settings
 {
     public string Roots { get; set; } = "";
+    public string Exclude { get; set; } = "";
     public string BackupDir { get; set; } = "";
     public bool IncludeCaches { get; set; } = true;
+    public double? Left { get; set; }
+    public double? Top { get; set; }
+    public double? Width { get; set; }
 
     static string FilePath => System.IO.Path.Combine(AppContext.BaseDirectory, "data", "settings.json");
 
@@ -53,8 +57,9 @@ public static class Core
                 psi.ArgumentList.Add("import sys; print(sys.version_info >= (3, 10))");
                 using var proc = Process.Start(psi);
                 if (proc == null) continue;
-                var output = proc.StandardOutput.ReadToEnd();
-                if (proc.WaitForExit(8000) && proc.ExitCode == 0 && output.Trim() == "True")
+                var output = proc.StandardOutput.ReadToEndAsync();  // read async so a hung interpreter cannot block past the timeout
+                if (!proc.WaitForExit(8000)) { try { proc.Kill(true); } catch { } continue; }
+                if (proc.ExitCode == 0 && output.Result.Trim() == "True")
                     return (python = (file, prefix)).Value;
             }
             catch { }

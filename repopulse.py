@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 IS_WIN = os.name == "nt"
 FRESH_HOURS = 24
 GC_THRESHOLD = 50 * 1024 * 1024
@@ -245,18 +245,43 @@ def hint_paths() -> list[tuple[str, str]]:
         pass
     base = os.environ.get("APPDATA")
     for app in ("Code", "Cursor", "Windsurf", "Code - Insiders"):
-        f = Path(base, app) if base else home / ".config" / app
-        f = f / "User" / "globalStorage" / "storage.json"
+        storage = (Path(base, app) if base else home / ".config" / app) / "User" / "globalStorage"
+        uris: list[str] = []
         try:
-            data = json.loads(f.read_text(encoding="utf-8"))
+            uris += _file_uris(json.loads((storage / "storage.json").read_text(encoding="utf-8")))
         except (OSError, ValueError):
-            continue
-        for uri in _file_uris(data):
+            pass
+        uris += _vscode_recent(storage / "state.vscdb")
+        for uri in uris:
             path = urllib.parse.unquote(uri[len("file://"):])
             if IS_WIN and re.match(r"^/[A-Za-z]:", path):
                 path = path[1:]
             hints.append((path, app))
+    jb = Path(base, "JetBrains") if base else home / ".config" / "JetBrains"
+    for xml in sorted(jb.glob("*/options/recentProjects.xml")) if jb.is_dir() else []:
+        try:
+            text = xml.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for key in re.findall(r'<entry key="([^"]+)"', text):
+            hints.append((key.replace("$USER_HOME$", str(home)), "JetBrains"))
     return hints
+
+
+def _vscode_recent(db: Path) -> list[str]:
+    """Recently opened folders from VS Code's state database (read-only, never locks it)."""
+    if not db.is_file():
+        return []
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"{db.as_uri()}?mode=ro&immutable=1", uri=True, timeout=1)
+        try:
+            row = con.execute("SELECT value FROM ItemTable WHERE key = 'history.recentlyOpenedPathsList'").fetchone()
+        finally:
+            con.close()
+        return _file_uris(json.loads(row[0])) if row else []
+    except (sqlite3.Error, ValueError, TypeError):
+        return []
 
 
 def _file_uris(node) -> list[str]:
@@ -274,6 +299,8 @@ def _file_uris(node) -> list[str]:
 
 def enclosing_git(path: str) -> tuple[str, str] | None:
     p = os.path.abspath(os.path.expanduser(path))
+    if "$" in path or not os.path.exists(p):  # deleted project or unexpanded IDE macro: never guess a parent
+        return None
     for _ in range(12):
         if os.path.isdir(p):
             kind = git_kind(p)
@@ -292,13 +319,23 @@ def linked_worktrees(repo_path: str) -> list[str]:
     return [os.path.normpath(p) for p in paths[1:] if os.path.isdir(p) and git_kind(p) == "worktree"]
 
 
-def discover(roots: list[str], max_depth: int = MAX_DEPTH, hints: bool = True) -> list[dict]:
+def _norm_key(path: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.expanduser(path)))
+
+
+def is_excluded(path: str, excluded: list[str]) -> bool:
+    key = _norm_key(path)
+    return any(key == e or key.startswith(e.rstrip("\\/") + os.sep) for e in excluded)
+
+
+def discover(roots: list[str], max_depth: int = MAX_DEPTH, hints: bool = True, exclude: list[str] | None = None) -> list[dict]:
     """Main repos and linked worktrees under the roots, from tool history, and from each repo's worktree list."""
     found: dict[str, dict] = {}
+    excluded = [_norm_key(e) for e in exclude or [] if e.strip()]
 
     def add(path: str, kind: str, source: str) -> None:
-        key = os.path.normcase(os.path.realpath(path))
-        if key not in found:
+        key = _norm_key(path)
+        if key not in found and not is_excluded(path, excluded):
             found[key] = {"path": os.path.normpath(path), "kind": kind, "source": source}
 
     for root in roots:
@@ -323,6 +360,8 @@ def discover(roots: list[str], max_depth: int = MAX_DEPTH, hints: bool = True) -
                             continue
                         name = e.name.lower()
                         if name in SKIP_WALK or name.startswith("$"):
+                            continue
+                        if excluded and is_excluded(e.path, excluded):
                             continue
                         stack.append((e.path, depth + 1))
             except OSError:
@@ -352,6 +391,7 @@ class Repo:
         self.remote = "origin" if "origin" in remotes else (remotes[0] if remotes else None)
         self.default = self._default_branch()
         self.has_head = git_ok(self.path, "rev-parse", "--verify", "-q", "HEAD") is not None
+        self._unpushed_commits: set[str] | bool | None = None
 
     def _default_branch(self) -> str | None:
         if self.remote:
@@ -387,9 +427,25 @@ class Repo:
         out = git_ok(self.path, "rev-list", "--count", rev, "--not", "--remotes")
         return int(out.strip()) if out else None
 
-    def fetch(self, timeout: float = 45) -> str | None:
+    def unpushed_tip(self, name: str, sha: str) -> int | None:
+        """unpushed() for a local branch, skipping the git call when the tip is already on a remote.
+
+        One `rev-list --branches --not --remotes` lists every commit that is on no remote; a branch
+        whose tip is not in it is fully pushed. Repos with hundreds of branches need one call, not hundreds.
+        """
         if not self.remote:
-            return "no remote"
+            return None
+        if self._unpushed_commits is None:
+            out = git_ok(self.path, "rev-list", "--branches", "--not", "--remotes")
+            self._unpushed_commits = set(out.split()) if out is not None else False
+        if self._unpushed_commits is not False and sha and sha not in self._unpushed_commits:
+            return 0
+        return self.unpushed(f"refs/heads/{name}")
+
+    def fetch(self, timeout: float = 45) -> str | None:
+        """None on success or when there is nothing to fetch from; otherwise the error."""
+        if not self.remote:
+            return None
         code, _, err = git(self.path, "fetch", "--prune", "--no-tags", "--quiet", self.remote, timeout=timeout)
         return None if code == 0 else (err.splitlines()[-1] if err else f"fetch failed ({code})")
 
@@ -457,15 +513,21 @@ def dirty_state(path: str) -> dict:
 def numstat(repo: Repo) -> dict[str, tuple]:
     if not repo.has_head:
         return {}
-    out = git_ok(repo.path, "diff", "--numstat", "HEAD") or ""
+    out = git_ok(repo.path, "diff", "--numstat", "-z", "HEAD") or ""
+    # -z: "add\trem\tpath\0", or for renames "add\trem\t\0old\0new\0"
+    parts = out.split("\0")
     stats = {}
-    for line in out.splitlines():
-        bits = line.split("\t", 2)
-        if len(bits) == 3:
-            add, rem, p = bits
-            if " => " in p:
-                p = p.split(" => ")[-1].replace("}", "").replace("{", "")
-            stats[p] = (None if add == "-" else int(add), None if rem == "-" else int(rem))
+    i = 0
+    while i < len(parts):
+        bits = parts[i].split("\t", 2)
+        i += 1
+        if len(bits) != 3:
+            continue
+        add, rem, p = bits
+        if not p and i + 1 < len(parts):
+            p = parts[i + 1]
+            i += 2
+        stats[p] = (None if add == "-" else int(add), None if rem == "-" else int(rem))
     return stats
 
 
@@ -479,7 +541,7 @@ def classify_branches(repo: Repo, trees: list[dict]) -> list[dict]:
     items = []
     for line in out.splitlines():
         name, upstream, track, sha, when = (line.split("\0") + ["", "", "", "", "0"])[:5]
-        unpushed = repo.unpushed(f"refs/heads/{name}")
+        unpushed = repo.unpushed_tip(name, sha)
         gone = "[gone]" in track
         base = {
             "kind": "branch", "target": name, "upstream": upstream or None, "upstream_gone": gone,
@@ -507,7 +569,8 @@ def classify_branches(repo: Repo, trees: list[dict]) -> list[dict]:
     return items
 
 
-def classify_worktrees(repo: Repo, trees: list[dict]) -> list[dict]:
+def classify_worktrees(repo: Repo, trees: list[dict], measure: bool = True) -> list[dict]:
+    """measure=False leaves sizes to the caller (a full scan reuses each worktree row's own walk)."""
     items = []
     fresh = repo.fresh()
     for t in trees:
@@ -520,9 +583,15 @@ def classify_worktrees(repo: Repo, trees: list[dict]) -> list[dict]:
         elif t["prunable"] or not exists:
             base.update(status="safe", reason="Folder already gone; only stale metadata remains", action="prune")
         else:
-            base["bytes"] = dir_size(t["path"])
+            base["bytes"] = dir_size(t["path"]) if measure else None
             d = dirty_state(t["path"])
-            unp = repo.unpushed(t["head"]) if t["head"] else None
+            if not t["head"]:
+                unp = None
+            elif t["branch"]:
+                unp = repo.unpushed_tip(t["branch"], t["head"])
+            else:  # detached HEAD: not covered by the branch-wide list
+                unp = repo.unpushed(t["head"])
+            precious = precious_ignored(t["path"])
             if d.get("error"):
                 base.update(status="keep", reason="Could not read worktree status")
             elif d["counts"]["total"]:
@@ -531,12 +600,38 @@ def classify_worktrees(repo: Repo, trees: list[dict]) -> list[dict]:
                 base.update(status="keep", reason="Could not verify against remotes")
             elif unp > 0:
                 base.update(status="keep", reason=f"{unp} unpushed commit(s)")
+            elif precious is None:
+                base.update(status="keep", reason="Could not list ignored files")
+            elif precious:
+                shown = ", ".join(precious[:3]) + ("â€¦" if len(precious) > 3 else "")
+                base.update(status="review", reason=f"Clean and pushed, but removal also deletes {len(precious)} "
+                                                    f"ignored item(s) that exist nowhere else: {shown}")
             elif not fresh:
                 base.update(status="review", reason="Clean and pushed at last fetch; fetch first")
             else:
                 base.update(status="safe", reason="Clean and fully pushed")
         items.append(base)
     return items
+
+
+def precious_ignored(path: str) -> list[str] | None:
+    """Ignored files in a worktree that are not rebuildable (.env, local config, data).
+
+    `git worktree remove` deletes ignored files without asking, so these keep a worktree out of Safe.
+    """
+    out = git_ok(path, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory", timeout=90)
+    if out is None:
+        return None
+    precious = []
+    for entry in (e for e in out.split("\0") if e):
+        name = entry.rstrip("/").rsplit("/", 1)[-1]
+        rule = JUNK_RULES.get(name)
+        if rule and not rule[2]:  # specific rebuildable folder; generic dist/build/out still count
+            continue
+        if name.endswith((".pyc", ".pyo")):
+            continue
+        precious.append(entry)
+    return precious
 
 
 def ignored_set(repo_path: str, rels: list[str]) -> set[str]:
@@ -633,7 +728,7 @@ def gc_item(repo: Repo) -> dict | None:
 
 # ---------------------------------------------------------------- scan
 
-def scan_repo(path: str, do_fetch: bool = False) -> dict:
+def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True) -> dict:
     started = now()
     try:
         repo = Repo(path)
@@ -685,7 +780,7 @@ def scan_repo(path: str, do_fetch: bool = False) -> dict:
 
     # dirty + diff preview
     dstate = dirty_state(repo.path)
-    stats = numstat(repo)
+    stats = numstat(repo) if dstate["files"] else {}
     files = []
     for f in dstate["files"][:DIFF_FILES]:
         add, rem = stats.get(f["path"], (None, None))
@@ -698,7 +793,7 @@ def scan_repo(path: str, do_fetch: bool = False) -> dict:
 
     # branches, worktrees and git garbage belong to the main repository row only
     trees = [] if is_wt else repo.worktrees()
-    items = [] if is_wt else classify_branches(repo, trees) + classify_worktrees(repo, trees)
+    items = [] if is_wt else classify_branches(repo, trees) + classify_worktrees(repo, trees, measure_worktrees)
     junk, wt_bytes = find_junk(repo)
     items += junk
     g = None if is_wt else gc_item(repo)
@@ -712,11 +807,16 @@ def scan_repo(path: str, do_fetch: bool = False) -> dict:
     result["worktrees"] = len([t for t in trees if not t["main"]])
     result["worktree_bytes"] = wt_bytes
     result["git_bytes"] = 0 if is_wt else dir_size(repo.git_dir)
-    result["safe_bytes"] = sum(i["bytes"] for i in items if i["status"] == "safe")
-    result["review_bytes"] = sum(i["bytes"] for i in items if i["status"] == "review")
+    tally_bytes(result)
     result["attention"] = attention(result)
     result["scan_ms"] = int((now() - started) * 1000)
     return result
+
+
+def tally_bytes(result: dict) -> None:
+    items = result["items"]
+    result["safe_bytes"] = sum(i["bytes"] or 0 for i in items if i["status"] == "safe")
+    result["review_bytes"] = sum(i["bytes"] or 0 for i in items if i["status"] == "review")
 
 
 def attention(r: dict) -> list[str]:
@@ -771,7 +871,7 @@ def cmd_scan(args) -> dict:
     if args.repo:
         entries = [{"path": os.path.normpath(p), "kind": git_kind(p) or "repo", "source": "argument"} for p in args.repo]
     else:
-        entries = discover(roots, args.depth, hints=not args.no_hints)
+        entries = discover(roots, args.depth, hints=not args.no_hints, exclude=(args.exclude or "").split(";"))
     workers = max(1, min(8, len(entries)))
     fetch_errors: dict[str, str | None] = {}
     if args.fetch:  # fetch every main repo first, so worktrees read fresh refs
@@ -781,7 +881,7 @@ def cmd_scan(args) -> dict:
                 fetch_errors[os.path.normcase(path)] = err
     results = []
     with cf.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(scan_repo, e["path"]): e for e in entries}
+        futures = {pool.submit(scan_repo, e["path"], False, False): e for e in entries}
         for fut in cf.as_completed(futures):
             e = futures[fut]
             try:
@@ -789,11 +889,23 @@ def cmd_scan(args) -> dict:
             except Exception as exc:  # one broken repo must not fail the scan
                 r = {"path": e["path"], "name": os.path.basename(e["path"]), "error": str(exc)}
             r["source"] = e["source"]
+            r.setdefault("kind", e["kind"])
             err = fetch_errors.get(os.path.normcase(e["path"]))
             if err and not r.get("error"):
                 r["fetch_error"] = err
                 r["attention"] = attention(r)
             results.append(r)
+    # worktree items were left unmeasured: reuse each worktree row's walk instead of walking the tree twice
+    row_bytes = {os.path.normcase(os.path.normpath(r["path"])): r["worktree_bytes"] for r in results
+                 if r.get("kind") == "worktree" and not r.get("error")}
+    for r in results:
+        if r.get("error"):
+            continue
+        for it in r["items"]:
+            if it["kind"] == "worktree" and it["bytes"] is None:
+                key = os.path.normcase(os.path.normpath(it["target"]))
+                it["bytes"] = row_bytes[key] if key in row_bytes else dir_size(it["target"])
+        tally_bytes(r)
     results.sort(key=lambda r: (not r.get("attention"), (r.get("parent_name") or r["name"]).lower(), r.get("kind") == "worktree", r["name"].lower()))
     caches = scan_caches() if args.caches else []
     ok = [r for r in results if not r.get("error")]
@@ -864,10 +976,15 @@ def cmd_backup(args) -> dict:
         return {"ok": False, "error": f"Dirty files total {human(total)}, above the {args.max_gb:g} GB backup limit. "
                                       f"Raise the limit or commit/ignore large assets first.", "bytes": total}
     dest.mkdir(parents=True, exist_ok=False)
+    copied, failed = [], []
     for rel in present:
         target = files_dir / rel
-        os.makedirs(longp(target.parent), exist_ok=True)
-        shutil.copy2(longp(os.path.join(repo.path, rel)), longp(target))
+        try:
+            os.makedirs(longp(target.parent), exist_ok=True)
+            shutil.copy2(longp(os.path.join(repo.path, rel)), longp(target))
+            copied.append(rel)
+        except OSError as exc:  # a locked or vanished file must not abort the rest of the backup
+            failed.append({"path": rel, "error": exc.strerror or str(exc)})
     if repo.has_head:
         for name, extra in (("changes.patch", ["HEAD"]), ("staged.patch", ["--cached"])):
             code, raw = git_bytes(repo.path, "diff", "--binary", *extra, timeout=120)
@@ -879,6 +996,15 @@ def cmd_backup(args) -> dict:
         refs.append("refs/stash")
     unp = repo.unpushed("--branches") if repo.remote else None
     stash_n = len([l for l in (git_ok(repo.path, "stash", "list") or "").splitlines() if l.strip()])
+    # the bundle can only carry refs/stash (the newest entry); every entry is also saved as a patch
+    stash_patches = []
+    for n in range(stash_n):
+        code, raw = git_bytes(repo.path, "stash", "show", "-p", "--binary", "--include-untracked", f"stash@{{{n}}}", timeout=120)
+        if code != 0:  # git < 2.32 has no --include-untracked for stash show
+            code, raw = git_bytes(repo.path, "stash", "show", "-p", "--binary", f"stash@{{{n}}}", timeout=120)
+        if code == 0 and raw:
+            (dest / f"stash-{n}.patch").write_bytes(raw)
+            stash_patches.append(f"stash-{n}.patch")
     if repo.has_head and (unp or stash_n or not repo.remote):
         neg = ["--not", "--remotes"] if repo.remote else []
         code, _, err = git(repo.path, "bundle", "create", str(dest / "unpushed.bundle"), *refs, *neg, timeout=600)
@@ -888,14 +1014,17 @@ def cmd_backup(args) -> dict:
     manifest = {
         "repo": repo.path, "created": dt.datetime.now().isoformat(timespec="seconds"), "head": head,
         "branch": (git_ok(repo.path, "symbolic-ref", "--quiet", "--short", "HEAD") or "").strip() or None,
-        "files": present, "deleted": deleted, "bytes": total, "bundle": bundle,
+        "files": copied, "failed": failed, "deleted": deleted, "bytes": total, "bundle": bundle,
+        "stash_patches": stash_patches,
         "restore": [
             "Files: copy files/ over the repository (or apply changes.patch with: git apply --binary changes.patch).",
             "Commits: git fetch <path>/unpushed.bundle '+refs/heads/*:refs/remotes/backup/*' then inspect backup/<branch>.",
+            "Stashes: git apply --binary stash-N.patch (stash-0 is the newest).",
         ],
     }
     (dest / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return {"ok": True, "backup": str(dest), "files": len(present), "deleted": len(deleted), "bytes": total, "bundle": bundle}
+    return {"ok": True, "backup": str(dest), "files": len(copied), "failed": failed, "deleted": len(deleted),
+            "bytes": total, "bundle": bundle, "stash_patches": len(stash_patches)}
 
 
 def cmd_sync(args) -> dict:
@@ -964,10 +1093,13 @@ def recycle(path: str) -> None:
 
 
 def remove_permanently(path: str) -> None:
-    def onerror(func, p, _exc):
+    def retry_writable(func, p, _exc):  # read-only files (common in .git packs and node_modules) on Windows
         os.chmod(p, stat.S_IWRITE)
         func(p)
-    shutil.rmtree(longp(path), onerror=onerror)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(longp(path), onexc=retry_writable)
+    else:
+        shutil.rmtree(longp(path), onerror=retry_writable)
 
 
 def within(child: str, parent: str) -> bool:
@@ -1080,6 +1212,30 @@ def cmd_diff(args) -> dict:
 
 # ---------------------------------------------------------------- CLI
 
+def render_text(result: dict) -> str:
+    """Plain-text report of a scan result, for terminal use (ASCII only)."""
+    if not result.get("ok"):
+        return "error: " + str(result.get("error"))
+    t = result["totals"]
+    lines = [f"Repo Pulse {VERSION}: {t['repos']} repos, {t['worktrees']} worktrees, "
+             f"{t['needs_attention']} need attention, {human(t['safe_bytes'])} safe / "
+             f"{human(t['review_bytes'])} review to reclaim ({result['scan_ms'] / 1000:.1f}s)", ""]
+    for r in result["repos"]:
+        label = ("  wt " if r.get("kind") == "worktree" else "") + r["name"]
+        if r.get("error"):
+            lines.append(f"[!] {label}  {r['path']}\n      {r['error']}")
+            continue
+        mark = "[!]" if r["attention"] else "[ok]"
+        lines.append(f"{mark:4} {label}  ({r.get('branch') or 'detached'})  {r['path']}")
+        lines += [f"      - {n}" for n in r["attention"]]
+        for it in sorted((i for i in r["items"] if i["status"] != "keep"), key=lambda i: -i["bytes"]):
+            lines.append(f"      {it['status']:6} {it['kind']:8} {human(it['bytes']):>9}  {it['target']}  [{it['id']}]")
+    if result.get("caches"):
+        lines += ["", "Global caches:"]
+        lines += [f"      {c['status']:6} {c['label']:20} {human(c['bytes']):>9}  {c['target']}  [{c['id']}]" for c in result["caches"]]
+    return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="repopulse", description="Repo Pulse core")
     p.add_argument("--version", action="version", version=VERSION)
@@ -1090,7 +1246,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--depth", type=int, default=MAX_DEPTH)
     s.add_argument("--fetch", action="store_true", help="git fetch --prune first (updates remote-tracking refs only)")
     s.add_argument("--caches", action="store_true", help="Include global package caches")
-    s.add_argument("--no-hints", action="store_true", help="Ignore folders known to Claude Code, Codex and VS Code")
+    s.add_argument("--no-hints", action="store_true", help="Ignore folders known to Claude Code, Codex, VS Code and JetBrains")
+    s.add_argument("--exclude", help="Semicolon-separated folders never to search or report")
+    s.add_argument("--text", action="store_true", help="Print a readable report instead of JSON")
     b = sub.add_parser("backup", help="Copy dirty files and bundle unpushed commits")
     b.add_argument("--repo", required=True)
     b.add_argument("--dest")
@@ -1117,6 +1275,10 @@ def main(argv: list[str] | None = None) -> int:
         result = handlers[args.cmd](args)
     except Exception as exc:
         result = {"ok": False, "error": str(exc)}
+    if getattr(args, "text", False):
+        sys.stdout.buffer.write(render_text(result).encode(sys.stdout.encoding or "utf-8", "replace") + b"\n")
+        sys.stdout.buffer.flush()
+        return 0 if result.get("ok") else 1
     data = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     sys.stdout.buffer.write(data + b"\n")
     sys.stdout.buffer.flush()

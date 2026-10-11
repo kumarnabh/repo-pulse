@@ -192,6 +192,30 @@ class TestWorktrees(Fixture):
         self.assertTrue((wts / "dirty" / "README.md").read_text() == "changed")
         self.assertTrue((wts / "ahead").exists())
 
+    def test_ignored_secrets_keep_worktree_out_of_safe(self):
+        Path(self.repo, ".gitignore").write_text(".env\nnode_modules/\n")
+        Path(self.repo, "package.json").write_text("{}")
+        g(self.repo, "add", ".")
+        g(self.repo, "commit", "-qm", "ignore")
+        g(self.repo, "push", "-q")
+        wts = self.tmp / "wts"
+        for name in ("secret", "deps"):
+            g(self.repo, "worktree", "add", "-q", str(wts / name), "-b", f"wt-{name}")
+            g(wts / name, "push", "-q", "-u", "origin", f"wt-{name}")
+        (wts / "secret" / ".env").write_text("TOKEN=only-copy")
+        (wts / "deps" / "node_modules").mkdir()
+        (wts / "deps" / "node_modules" / "x.js").write_text("x")
+        self.fetch()
+        s = self.scan()
+        secret = by_target(s, "worktree", str(wts / "secret"))
+        self.assertEqual(secret["status"], "review")
+        self.assertIn(".env", secret["reason"])
+        self.assertEqual(by_target(s, "worktree", str(wts / "deps"))["status"], "safe")
+        res = rp.cmd_clean(rp.build_parser().parse_args(
+            ["clean", "--repo", str(self.repo), "--ids", secret["id"], "--dest", str(self.dest)]))
+        self.assertFalse(res["results"][0]["done"])
+        self.assertEqual((wts / "secret" / ".env").read_text(), "TOKEN=only-copy")
+
     def test_claude_style_worktree_inside_repo(self):
         inner = self.repo / ".claude" / "worktrees" / "agent-1"
         Path(self.repo, ".gitignore").write_text(".claude/worktrees/\n")
@@ -361,6 +385,29 @@ class TestStatusSyncBackup(Fixture):
         heads = g(self.repo, "bundle", "list-heads", str(Path(res["backup"]) / "unpushed.bundle"))
         self.assertIn(stash_sha, heads)
 
+    def test_every_stash_is_saved(self):
+        for text in ("first", "second", "third"):
+            Path(self.repo, "README.md").write_text(text)
+            g(self.repo, "stash", "push", "-q", "-m", text)
+        res = rp.cmd_backup(rp.build_parser().parse_args(["backup", "--repo", str(self.repo), "--dest", str(self.dest)]))
+        self.assertEqual(res["stash_patches"], 3)
+        b = Path(res["backup"])
+        self.assertIn("+first", (b / "stash-2.patch").read_text())
+        self.assertIn("+third", (b / "stash-0.patch").read_text())
+        # the oldest stash restores from its patch
+        g(self.repo, "apply", "--binary", str(b / "stash-2.patch"))
+        self.assertEqual(Path(self.repo, "README.md").read_text(), "first")
+
+    def test_renamed_file_in_folder_gets_line_counts(self):
+        body = "".join(f"line {n}\n" for n in range(20))
+        commit(self.repo, "src/old/mod.py", body)
+        g(self.repo, "mv", "src/old", "src/new")
+        Path(self.repo, "src", "new", "mod.py").write_text(body + "extra\n")
+        g(self.repo, "add", "-A")
+        stats = rp.numstat(rp.Repo(str(self.repo)))
+        self.assertEqual(stats.get("src/new/mod.py"), (1, 0))  # git reports this as src/{old => new}/mod.py
+        self.assertNotIn("src/old/mod.py", stats)
+
     def test_backup_size_limit(self):
         Path(self.repo, "big.bin").write_bytes(b"0" * 2_000_000)
         res = rp.cmd_backup(rp.build_parser().parse_args(
@@ -419,12 +466,59 @@ class TestDiscoveryAndCli(Fixture):
         Path(self.tmp, "code", "app", "node_modules").mkdir()
         found = rp.discover([str(self.tmp / "code")])
         self.assertEqual([(os.path.basename(e["path"]), e["kind"]) for e in found], [("app", "repo"), ("wt", "worktree")])
-        env = dict(ENV, HOME=str(self.home), USERPROFILE=str(self.home))
+        # the child process must not read the host's tool history either (APPDATA holds VS Code's)
+        env = dict(ENV, HOME=str(self.home), USERPROFILE=str(self.home), APPDATA=os.environ["APPDATA"])
         out = subprocess.run([sys.executable, str(Path(rp.__file__)), "scan", "--roots", str(self.tmp / "code")],
                              capture_output=True, env=env)
         data = json.loads(out.stdout)
         self.assertTrue(data["ok"])
         self.assertEqual((data["totals"]["repos"], data["totals"]["worktrees"]), (1, 1))
+        text = subprocess.run([sys.executable, str(Path(rp.__file__)), "scan", "--roots", str(self.tmp / "code"), "--text"],
+                              capture_output=True, env=env)
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn(b"1 repos, 1 worktrees", text.stdout)
+
+    def test_exclude(self):
+        found = rp.discover([str(self.tmp / "code")], exclude=[str(self.repo)])
+        self.assertEqual(found, [])
+        g(self.repo, "worktree", "add", "-q", str(self.tmp / "code" / "wt"), "-b", "wt")
+        found = rp.discover([str(self.tmp / "code")], exclude=[str(self.tmp / "code" / "wt")])
+        self.assertEqual([os.path.basename(e["path"]) for e in found], ["app"])
+
+    def test_fetch_scan_of_local_only_repo_is_not_an_error(self):
+        solo = self.tmp / "code" / "solo"
+        solo.mkdir()
+        g(solo, "init", "-q")
+        commit(solo, "a.txt")
+        data = rp.cmd_scan(rp.build_parser().parse_args(["scan", "--roots", str(self.tmp / "code"), "--fetch", "--no-hints"]))
+        r = next(r for r in data["repos"] if r["name"] == "solo")
+        self.assertFalse(r.get("fetch_error"))
+        self.assertFalse(any("Fetch failed" in n for n in r["attention"]))
+
+    def test_more_tool_history(self):
+        jb_proj, vs_proj, parent_only = self.tmp / "jb-proj", self.tmp / "vs-recent", self.tmp / "parent-only"
+        for p in (jb_proj, vs_proj, parent_only):
+            p.mkdir()
+            g(p, "init", "-q")
+        jb = Path(os.environ["APPDATA"]) / "JetBrains" / "PyCharm2026.2" / "options"
+        jb.mkdir(parents=True)
+        (jb / "recentProjects.xml").write_text(
+            f'<application><component name="RecentProjectsManager"><option name="additionalInfo"><map>'
+            f'<entry key="{jb_proj.as_posix()}"><value/></entry>'
+            f'<entry key="$USER_HOME$/missing"><value/></entry></map></option></component></application>')
+        import sqlite3
+        storage = Path(os.environ["APPDATA"]) / "Cursor" / "User" / "globalStorage"
+        storage.mkdir(parents=True)
+        con = sqlite3.connect(storage / "state.vscdb")
+        con.execute("CREATE TABLE ItemTable (key TEXT UNIQUE, value BLOB)")
+        con.execute("INSERT INTO ItemTable VALUES ('history.recentlyOpenedPathsList', ?)",
+                    (json.dumps({"entries": [{"folderUri": vs_proj.as_uri()}, {"folderUri": (parent_only / "deleted").as_uri()}]}),))
+        con.commit()
+        con.close()
+        found = {os.path.basename(e["path"]): e["source"] for e in rp.discover([str(self.tmp / "code")])}
+        self.assertEqual(found.get("jb-proj"), "JetBrains")
+        self.assertEqual(found.get("vs-recent"), "Cursor")
+        self.assertNotIn("parent-only", found)  # a deleted folder never resolves to its parent repo
 
     def test_worktree_outside_roots_and_submodule(self):
         agent = self.tmp / "elsewhere" / ".codex" / "worktrees" / "task-1"

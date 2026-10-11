@@ -77,6 +77,14 @@ public sealed class MainWindow : Window
         dock.Children.Add(scroller);
         Content = GlassShell(dock);
         RefreshTabs();
+        RestorePlacement();
+        Closing += (_, _) => SavePlacement();
+        KeyDown += async (_, e) =>
+        {
+            if (e.Key != Key.F5) return;
+            e.Handled = true;
+            await Scan(Keyboard.Modifiers.HasFlag(ModifierKeys.Shift));
+        };
         Loaded += async (_, _) => await Scan(false);
         SizeChanged += (_, e) =>
         {
@@ -101,6 +109,28 @@ public sealed class MainWindow : Window
     }
 
     void Say(string text) => footer.Text = text;
+
+    /// <summary>Reopen where the window was last closed, if that spot is still on a screen.</summary>
+    void RestorePlacement()
+    {
+        if (settings.Width is { } w && w >= MinWidth) Width = Math.Min(w, SystemParameters.VirtualScreenWidth);
+        if (settings.Left is not { } left || settings.Top is not { } top) return;
+        var screen = new Rect(SystemParameters.VirtualScreenLeft, SystemParameters.VirtualScreenTop,
+                              SystemParameters.VirtualScreenWidth, SystemParameters.VirtualScreenHeight);
+        if (!screen.Contains(new Point(left + 40, top + 20))) return;  // monitor unplugged since: stay centered
+        WindowStartupLocation = WindowStartupLocation.Manual;
+        Left = left;
+        Top = top;
+    }
+
+    void SavePlacement()
+    {
+        if (WindowState != WindowState.Normal) return;
+        settings.Left = Left;
+        settings.Top = Top;
+        settings.Width = ActualWidth;
+        try { settings.Save(); } catch { }  // a read-only install folder must not block closing
+    }
 
     // ------------------------------------------------------------ fit to content
 
@@ -130,6 +160,7 @@ public sealed class MainWindow : Window
         {
             var args = new List<string> { "scan" };
             if (!string.IsNullOrWhiteSpace(settings.Roots)) { args.Add("--roots"); args.Add(settings.Roots); }
+            if (!string.IsNullOrWhiteSpace(settings.Exclude)) { args.Add("--exclude"); args.Add(settings.Exclude); }
             if (settings.IncludeCaches) args.Add("--caches");
             if (fetch) args.Add("--fetch");
             var result = await Core.Run(ScanTimeout, args.ToArray());
@@ -138,7 +169,8 @@ public sealed class MainWindow : Window
             hasScan = true;
             selected.Clear();
             Render();
-            Say($"Scanned {DateTime.Now:HH:mm} in {result.N("scan_ms") / 1000.0:0.0}s. Nothing was changed.");
+            Say($"Scanned {DateTime.Now:HH:mm} in {result.N("scan_ms") / 1000.0:0.0}s. " +
+                (fetch ? "Only remote-tracking refs were updated." : "Nothing was changed."));
         }
         catch (Exception ex) { Say(ex.Message); }
         finally { busy = false; }
@@ -506,7 +538,7 @@ public sealed class MainWindow : Window
             if (group.Key != "") { args.Add("--repo"); args.Add(group.Key); }
             if (group.Any(g => g.Item.S("status") == "review")) args.Add("--allow-review");
             var res = await Act($"Cleaning {Path.GetFileName(group.Key.TrimEnd('\\', '/'))}…", WithDest(args.ToArray()));
-            if (res is not { } result) return;
+            if (res is not { } result) { failures.Add($"{group.Key}: core did not finish"); break; }  // still rescan below
             if (!result.B("ok")) { failures.Add(result.S("error")); continue; }
             freed += result.N("freed_bytes");
             foreach (var x in result.A("results").Where(x => !x.B("done")))
@@ -548,8 +580,12 @@ public sealed class MainWindow : Window
         if (!result.B("ok")) { MessageBox.Show(result.S("error"), "Backup not made", MessageBoxButton.OK, MessageBoxImage.Warning); Say("Backup not made."); return; }
         var dest = result.S("backup");
         var bundle = result.O("bundle");
+        var failed = result.A("failed").ToList();
         var detail = $"{result.N("files")} file(s), {J.Human(result.N("bytes"))}" +
-                     (bundle.ValueKind == JsonValueKind.Object ? (bundle.B("ok") ? " + unpushed commits/stashes bundle" : " — bundle FAILED: " + bundle.S("error")) : "");
+                     (bundle.ValueKind == JsonValueKind.Object ? (bundle.B("ok") ? " + unpushed commits/stashes bundle" : " — bundle FAILED: " + bundle.S("error")) : "") +
+                     (result.N("stash_patches") > 0 ? $" + {result.N("stash_patches")} stash patch(es)" : "") +
+                     (failed.Count > 0 ? $"\n\n{failed.Count} file(s) could not be copied (in use?): " +
+                                         string.Join(", ", failed.Take(3).Select(f => f.S("path"))) : "");
         Say($"Backed up {r.S("name")}: {detail}");
         if (MessageBox.Show($"Backup saved:\n{dest}\n\n{detail}\n\nOpen the folder?", "Repo Pulse", MessageBoxButton.YesNo, MessageBoxImage.Information) == MessageBoxResult.Yes)
             OpenFolder(dest);

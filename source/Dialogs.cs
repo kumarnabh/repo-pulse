@@ -63,14 +63,17 @@ public sealed class SettingsWindow : Window
         MakeGlass(this);
 
         var roots = Box(settings.Roots);
+        var exclude = Box(settings.Exclude);
         var backup = Box(settings.BackupDir);
         var caches = new CheckBox { IsChecked = settings.IncludeCaches, Margin = new Thickness(0, 10, 0, 0),
                                     Content = T("Include global package caches (npm, pip, Yarn, pnpm, NuGet, Playwright)", 12) };
 
         var body = new StackPanel();
         body.Children.Add(T("Settings", 16, Text, bold: true));
-        body.Children.Add(Hint("Folders to scan (separate with ;). Empty = every fixed drive. Folders known to Claude Code, Codex and VS Code, and every linked worktree, are always included."));
+        body.Children.Add(Hint("Folders to scan (separate with ;). Empty = every fixed drive. Folders known to Claude Code, Codex, VS Code and JetBrains IDEs, and every linked worktree, are always included."));
         body.Children.Add(roots);
+        body.Children.Add(Hint("Folders to skip (separate with ;). Never searched or shown, even when a tool knows them."));
+        body.Children.Add(exclude);
         body.Children.Add(Hint("Backup folder. Empty = %USERPROFILE%\\RepoPulse Backups"));
         body.Children.Add(backup);
         body.Children.Add(caches);
@@ -78,6 +81,7 @@ public sealed class SettingsWindow : Window
             Pill("Save", () =>
             {
                 settings.Roots = roots.Text.Trim();
+                settings.Exclude = exclude.Text.Trim();
                 settings.BackupDir = backup.Text.Trim();
                 settings.IncludeCaches = caches.IsChecked == true;
                 DialogResult = true;
@@ -86,6 +90,8 @@ public sealed class SettingsWindow : Window
             Pill("Cancel", () => { DialogResult = false; return Task.CompletedTask; }));
         buttons.Margin = new Thickness(0, 14, 0, 0);
         body.Children.Add(buttons);
+        var version = typeof(SettingsWindow).Assembly.GetName().Version;
+        body.Children.Add(Hint($"Repo Pulse {version?.ToString(3)} · F5 scan · Shift+F5 fetch + scan · github.com/kumarnabh/repo-pulse"));
         body.MouseLeftButtonDown += (_, e) => { if (e.ButtonState == MouseButtonState.Pressed && e.OriginalSource is not TextBox) DragMove(); };
         Content = GlassShell(body);
     }
