@@ -16,14 +16,18 @@ A small Windows glass widget for developers with too many repositories. Sibling 
 - **Backup**: one click copies dirty files and bundles unpushed commits and stashes. The repo itself is not touched.
 - **Sync**: fast-forward only. Push without force. Never merges, rebases or force-pushes.
 - **Space**: merged or fully pushed branches, stale worktrees (including AI-agent worktrees), `node_modules`, `.venv`, build caches, git garbage and global package caches, each marked **Safe** or **Review** with its size.
+- **Finds everything**: every fixed drive, plus folders known to Claude Code, Codex, VS Code, Cursor and Windsurf, plus every linked worktree (⎇) wherever it lives.
+- **Compact**: problems as one-line rows, healthy repos as tiles; the window fits its content with no scrollbar.
 
 ## Start
 
 1. Install **Python 3.10+** (python.org, with the launcher) and the **.NET 8 SDK**.
 2. Double-click **Build.cmd**, then **Launch Repo Pulse.cmd**.
-3. Open **⚙** and set your code folders, e.g. `D:\Code;C:\Users\you\source\repos`.
+3. Optional: in **⚙**, limit scanning to your code folders (e.g. `D:\Code;C:\Users\you\source\repos`) for faster scans.
+   Leave it empty to scan every fixed drive.
 
 The first scan is read-only. Use **Fetch + scan** for accurate ahead/behind numbers.
+Hover the summary line to see which folders were searched and how each repo was found.
 
 ## What "Safe" means
 
@@ -47,7 +51,8 @@ git fetch "<backup>\branch-NAME.bundle" NAME:NAME
 The core works without the widget:
 
 ```
-py -3 repopulse.py scan --roots "D:\Code" --fetch
+py -3 repopulse.py scan --fetch                 # every fixed drive + tool history + worktrees
+py -3 repopulse.py scan --roots "D:\Code" --no-hints
 py -3 repopulse.py backup --repo "D:\Code\app"
 py -3 repopulse.py sync --repo "D:\Code\app" [--push]
 py -3 repopulse.py clean --repo "D:\Code\app" --ids ID1,ID2
@@ -73,7 +78,7 @@ when you ask for them. Settings live in `data\settings.json`.
 py -3 -m unittest discover -s tests -v
 ```
 
-21 fixture tests run real git operations against a local bare remote, covering unpushed
+25 fixture tests run real git operations against a local bare remote, covering unpushed
 commits, stale fetches, squash-merged branches, dirty or locked worktrees, tracked files
 inside junk folders, and changes made between scan and cleanup. See [TESTING.md](TESTING.md)
 for the manual Windows checklist.

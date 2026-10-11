@@ -33,13 +33,26 @@ repopulse.py clean   --repo PATH --ids ID1,ID2 [--allow-review] [--dest DIR]
 ```
 
 `scan` never changes anything, except `--fetch`, which runs
-`git fetch --prune --no-tags origin` (it updates only remote-tracking refs).
+`git fetch --prune --no-tags origin` on every main repository before scanning (it updates only
+remote-tracking refs). `--no-hints` skips tool-history discovery.
+
+## Widget layout
+
+- **Status**: repositories needing attention as one-line rows (status dot, name, compact chips;
+  click to expand details, files and actions). Healthy repositories as a tile grid. Linked
+  worktrees are nested under their repository.
+- **Space**: one line per item with size; the reason is in the tooltip.
+- The window fits its height to the content (up to the screen's work area) and hides the
+  scrollbar; the mouse wheel still scrolls if content exceeds the screen. Resizing by hand turns
+  fitting off; double-clicking the header turns it back on.
 
 ## Repo status
 
 | Field | Meaning |
 |---|---|
-| `main_state` | `in_sync`, `behind` (fast-forwardable), `ahead` (unpushed), `diverged`, `no_remote`, `no_main` |
+| `kind` | `repo` or `worktree` (with `parent`, `parent_name`) |
+| `main_state` | `in_sync`, `behind` (fast-forwardable), `ahead` (unpushed), `diverged`, `no_remote`, `no_main`, `worktree` |
+| `branch_ahead` / `branch_behind` | current branch vs its upstream; never-pushed branches count commits on no remote |
 | `ahead` / `behind` | commit counts between local default branch and `origin/<default>` |
 | `dirty` | staged, modified, untracked, conflicted counts; `diff` = per-file +/− lines |
 | `unpushed_branches` | local branches whose commits exist on no remote |
@@ -104,10 +117,25 @@ The working tree is not modified.
 
 ## Repository discovery
 
-- Walks each root to depth 5, skipping AppData, package caches, dependency folders and system folders.
-- A folder with a `.git` directory is a repository. Folders with a `.git` file (linked worktrees,
-  submodules) are not listed separately; linked worktrees appear under their main repository.
-- Junk detection walks the main worktree to depth 6 and does not descend into nested repositories or worktrees.
+Three sources, merged and de-duplicated by real path:
+
+1. **Folders**: each root is walked to depth 6, skipping system folders, AppData, package caches
+   and dependency folders. With no roots configured, every fixed drive is a root on Windows
+   (the home folder elsewhere). Network and removable drives are never walked.
+2. **Tool history**: folders recorded by Claude Code (`~/.claude.json` projects), Codex
+   (`~/.codex/config.toml` projects) and VS Code / Cursor / Windsurf (`storage.json` workspace URIs).
+   Each path is resolved to its enclosing repository. Disable with `--no-hints`.
+3. **Worktree lists**: every linked worktree of every found repository, wherever it lives
+   (for example `~/.codex/worktrees` or `.claude/worktrees`).
+
+A `.git` directory marks a main repository; a `.git` file pointing into `…/worktrees/` marks a
+linked worktree, which gets its own row. Submodules are not listed.
+
+Linked-worktree rows report their branch against its upstream and their own rebuildable folders;
+branches, worktree cleanup and `git gc` stay on the main repository row. Totals count a worktree's
+folders once, even when the worktree itself is a Safe cleanup item.
+
+Junk detection walks each worktree to depth 6 and does not descend into nested repositories or worktrees.
 
 ## Global caches (optional)
 

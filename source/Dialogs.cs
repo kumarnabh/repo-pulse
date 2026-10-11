@@ -69,7 +69,7 @@ public sealed class SettingsWindow : Window
 
         var body = new StackPanel();
         body.Children.Add(T("Settings", 16, Text, bold: true));
-        body.Children.Add(Hint("Folders to scan for repositories (separate with ;). Empty = your user folder."));
+        body.Children.Add(Hint("Folders to scan (separate with ;). Empty = every fixed drive. Folders known to Claude Code, Codex and VS Code, and every linked worktree, are always included."));
         body.Children.Add(roots);
         body.Children.Add(Hint("Backup folder. Empty = %USERPROFILE%\\RepoPulse Backups"));
         body.Children.Add(backup);

@@ -50,6 +50,11 @@ class Fixture(unittest.TestCase):
         # resolve() expands Windows 8.3 short names (RUNNER~1) so paths match what git reports
         self.tmp = Path(tempfile.mkdtemp(prefix="repopulse-")).resolve()
         os.environ["REPOPULSE_TRASH"] = str(self.tmp / "backups")
+        # isolate tool-history hints (~/.claude.json etc.) from the machine running the tests
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self._env = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE", "APPDATA")}
+        os.environ.update(HOME=str(self.home), USERPROFILE=str(self.home), APPDATA=str(self.home / "AppData" / "Roaming"))
         self.remote = self.tmp / "remote.git"
         g(self.tmp, "init", "-q", "--bare", str(self.remote))
         self.repo = self.tmp / "code" / "app"
@@ -61,6 +66,11 @@ class Fixture(unittest.TestCase):
         self.dest = self.tmp / "backups"
 
     def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def fetch(self):
@@ -408,12 +418,72 @@ class TestDiscoveryAndCli(Fixture):
         g(self.repo, "worktree", "add", "-q", str(self.tmp / "code" / "wt"), "-b", "wt")
         Path(self.tmp, "code", "app", "node_modules").mkdir()
         found = rp.discover([str(self.tmp / "code")])
-        self.assertEqual([os.path.basename(p) for p in found], ["app"])
+        self.assertEqual([(os.path.basename(e["path"]), e["kind"]) for e in found], [("app", "repo"), ("wt", "worktree")])
+        env = dict(ENV, HOME=str(self.home), USERPROFILE=str(self.home))
         out = subprocess.run([sys.executable, str(Path(rp.__file__)), "scan", "--roots", str(self.tmp / "code")],
-                             capture_output=True, env=ENV)
+                             capture_output=True, env=env)
         data = json.loads(out.stdout)
         self.assertTrue(data["ok"])
-        self.assertEqual(data["totals"]["repos"], 1)
+        self.assertEqual((data["totals"]["repos"], data["totals"]["worktrees"]), (1, 1))
+
+    def test_worktree_outside_roots_and_submodule(self):
+        agent = self.tmp / "elsewhere" / ".codex" / "worktrees" / "task-1"
+        g(self.repo, "worktree", "add", "-q", str(agent), "-b", "task-1")
+        lib = self.tmp / "lib"
+        lib.mkdir()
+        g(lib, "init", "-q")
+        commit(lib, "lib.txt")
+        g(self.repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(lib), "vendor/lib")
+        found = {os.path.normcase(e["path"]): e for e in rp.discover([str(self.tmp / "code")])}
+        self.assertIn(os.path.normcase(str(agent)), found)
+        self.assertEqual(found[os.path.normcase(str(agent))]["source"], "worktree list")
+        self.assertNotIn(os.path.normcase(str(self.repo / "vendor" / "lib")), found)
+
+    def test_tool_history_hints(self):
+        outside = self.tmp / "D-drive"
+        for name in ("claude-proj", "codex-proj", "vscode-proj"):
+            (outside / name).mkdir(parents=True)
+            g(outside / name, "init", "-q")
+            commit(outside / name, "a.txt")
+        (outside / "claude-proj" / "src").mkdir()
+        (self.home / ".claude.json").write_text(json.dumps({"projects": {str(outside / "claude-proj" / "src"): {}}}))
+        (self.home / ".codex").mkdir()
+        (self.home / ".codex" / "config.toml").write_text(f"[projects.'{outside / 'codex-proj'}']\ntrust_level = \"trusted\"\n")
+        storage = Path(os.environ["APPDATA"]) / "Code" / "User" / "globalStorage"  # setUp sets APPDATA on every OS
+        storage.mkdir(parents=True)
+        (storage / "storage.json").write_text(json.dumps({"backupWorkspaces": {"folders": [{"folderUri": (outside / "vscode-proj").as_uri()}]}}))
+        found = {os.path.basename(e["path"]): e["source"] for e in rp.discover([str(self.tmp / "code")])}
+        self.assertEqual(found.get("claude-proj"), "Claude Code")
+        self.assertEqual(found.get("codex-proj"), "Codex")
+        self.assertEqual(found.get("vscode-proj"), "Code")
+        self.assertNotIn("claude-proj", {os.path.basename(e["path"]) for e in rp.discover([str(self.tmp / "code")], hints=False)})
+
+    def test_worktree_row(self):
+        wt = self.tmp / "wt-feature"
+        g(self.repo, "worktree", "add", "-q", str(wt), "-b", "feature")
+        commit(wt, "f.txt")
+        Path(wt, ".gitignore").write_text("node_modules/\n")
+        Path(wt, "package.json").write_text("{}")
+        (wt / "node_modules").mkdir()
+        (wt / "node_modules" / "x.js").write_text("x" * 3000)
+        r = rp.scan_repo(str(wt))
+        self.assertEqual(r["kind"], "worktree")
+        self.assertEqual(os.path.normcase(r["parent"]), os.path.normcase(str(self.repo)))
+        self.assertEqual(r["branch"], "feature")
+        self.assertEqual(r["branch_ahead"], 1)
+        self.assertTrue(any("feature has 1 unpushed" in n for n in r["attention"]))
+        self.assertEqual({i["kind"] for i in r["items"]}, {"folder"})
+        self.assertTrue(any(i["target"] == "node_modules" for i in r["items"]))
+        self.assertEqual(r["git_bytes"], 0)
+
+    def test_branch_behind_upstream(self):
+        g(self.repo, "switch", "-qc", "topic")
+        commit(self.repo, "t.txt")
+        g(self.repo, "push", "-q", "-u", "origin", "topic")
+        g(self.repo, "reset", "-q", "--hard", "HEAD~1")
+        r = self.scan()
+        self.assertEqual((r["branch_ahead"], r["branch_behind"]), (0, 1))
+        self.assertTrue(any("topic is 1 behind" in n for n in r["attention"]))
 
     def test_broken_repo_does_not_fail_scan(self):
         broken = self.tmp / "code" / "broken"

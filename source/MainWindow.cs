@@ -6,6 +6,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 using static RepoPulse.Ui;
 
 namespace RepoPulse;
@@ -14,14 +15,17 @@ public sealed class MainWindow : Window
 {
     readonly Settings settings = Settings.Load();
     readonly StackPanel list = new();
+    readonly ScrollViewer scroller;
     readonly TextBlock summary = T("Scanning…", 12, Dim);
     readonly TextBlock footer = T("", 11, Dim, wrap: true);
     readonly Border tabStatus, tabSpace;
-    readonly HashSet<string> expanded = new();
+    readonly HashSet<string> expanded = new();   // repo rows showing details
+    readonly HashSet<string> diffOpen = new();   // repo rows showing changed files
     // repo path ("" for global caches) -> selected item ids
     readonly Dictionary<string, HashSet<string>> selected = new();
     JsonElement scan;
-    bool hasScan, busy;
+    bool hasScan, busy, autoFit = true;
+    double fitTarget;
     string tab = "status";
 
     static readonly TimeSpan ScanTimeout = TimeSpan.FromMinutes(15);
@@ -29,7 +33,7 @@ public sealed class MainWindow : Window
     public MainWindow()
     {
         Title = "Repo Pulse";
-        Width = 500; Height = 720; MinWidth = 400; MinHeight = 420;
+        Width = 520; Height = 560; MinWidth = 400; MinHeight = 260;
         ResizeMode = ResizeMode.CanResizeWithGrip;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         MakeGlass(this);
@@ -41,18 +45,25 @@ public sealed class MainWindow : Window
             Pill("⚙", OpenSettings, tip: "Scan folders and backup location"),
             Pill("–", () => { WindowState = WindowState.Minimized; return Task.CompletedTask; }),
             Pill("×", () => { Close(); return Task.CompletedTask; }));
-        var header = new DockPanel { LastChildFill = false, Background = Brushes.Transparent };
+        var header = new DockPanel { LastChildFill = false, Background = Brushes.Transparent,
+                                     ToolTip = "Drag to move · double-click to fit the window to its content" };
         DockPanel.SetDock(actions, Dock.Right);
         header.Children.Add(actions);
         header.Children.Add(title);
-        header.MouseLeftButtonDown += (_, e) => { if (e.ButtonState == MouseButtonState.Pressed) DragMove(); };
+        header.MouseLeftButtonDown += (_, e) =>
+        {
+            if (e.ClickCount == 2) { autoFit = true; ScheduleFit(); return; }
+            if (e.ButtonState == MouseButtonState.Pressed) DragMove();
+        };
 
         tabStatus = Tab("Status", "status");
         tabSpace = Tab("Space", "space");
         var tabs = Row(tabStatus, tabSpace);
-        tabs.Margin = new Thickness(0, 8, 0, 8);
+        tabs.Margin = new Thickness(0, 8, 0, 6);
 
-        var scroller = new ScrollViewer { Content = list, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(0, 0, 4, 0) };
+        // Scrolling still works with the wheel when content exceeds the screen; the bar itself stays hidden.
+        scroller = new ScrollViewer { Content = list, VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
+                                      HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
         var top = new StackPanel();
         top.Children.Add(header);
         top.Children.Add(summary);
@@ -67,11 +78,16 @@ public sealed class MainWindow : Window
         Content = GlassShell(dock);
         RefreshTabs();
         Loaded += async (_, _) => await Scan(false);
+        SizeChanged += (_, e) =>
+        {
+            // A height we did not set means the user resized by hand: stop auto-fitting until a header double-click.
+            if (fitTarget > 0 && e.HeightChanged && Math.Abs(e.NewSize.Height - fitTarget) > 2) autoFit = false;
+        };
     }
 
     Border Tab(string text, string key)
     {
-        var b = new Border { CornerRadius = new CornerRadius(10), Padding = new Thickness(14, 4, 14, 5), Margin = new Thickness(0, 0, 6, 0), Cursor = Cursors.Hand,
+        var b = new Border { CornerRadius = new CornerRadius(10), Padding = new Thickness(14, 3, 14, 4), Margin = new Thickness(0, 0, 6, 0), Cursor = Cursors.Hand,
                              Child = T(text, 13) };
         b.MouseLeftButtonDown += (_, e) => e.Handled = true;
         b.MouseLeftButtonUp += (_, _) => { tab = key; RefreshTabs(); Render(); };
@@ -85,6 +101,23 @@ public sealed class MainWindow : Window
     }
 
     void Say(string text) => footer.Text = text;
+
+    // ------------------------------------------------------------ fit to content
+
+    void ScheduleFit() => Dispatcher.BeginInvoke(new Action(FitHeight), DispatcherPriority.Loaded);
+
+    void FitHeight()
+    {
+        if (!autoFit || WindowState != WindowState.Normal || scroller.ActualHeight <= 0) return;
+        list.Measure(new Size(Math.Max(100, scroller.ActualWidth), double.PositiveInfinity));
+        var chrome = ActualHeight - scroller.ActualHeight;
+        var area = SystemParameters.WorkArea;
+        var target = Math.Min(Math.Max(MinHeight, chrome + list.DesiredSize.Height + 4), area.Height - 16);
+        fitTarget = target;
+        if (Math.Abs(target - ActualHeight) < 2) return;
+        Height = target;
+        if (Top + target > area.Bottom) Top = Math.Max(area.Top, area.Bottom - target);
+    }
 
     // ------------------------------------------------------------ core calls
 
@@ -105,7 +138,7 @@ public sealed class MainWindow : Window
             hasScan = true;
             selected.Clear();
             Render();
-            Say($"Scanned {DateTime.Now:HH:mm}. Nothing was changed.");
+            Say($"Scanned {DateTime.Now:HH:mm} in {result.N("scan_ms") / 1000.0:0.0}s. Nothing was changed.");
         }
         catch (Exception ex) { Say(ex.Message); }
         finally { busy = false; }
@@ -131,91 +164,206 @@ public sealed class MainWindow : Window
         list.Children.Clear();
         if (!hasScan) return;
         var totals = scan.O("totals");
-        summary.Text = $"{totals.N("repos")} repos · {totals.N("needs_attention")} need attention · " +
-                       $"{J.Human(totals.N("safe_bytes"))} safe to reclaim · {J.Human(totals.N("review_bytes"))} to review";
+        var wt = totals.N("worktrees");
+        summary.Text = $"{totals.N("repos")} repos" + (wt > 0 ? $" · {wt} worktrees" : "") +
+                       $" · {totals.N("needs_attention")} need attention · {J.Human(totals.N("safe_bytes"))} safe to reclaim";
+        var sources = scan.O("sources");
+        var found = sources.ValueKind == JsonValueKind.Object
+            ? string.Join(", ", sources.EnumerateObject().Select(p => $"{p.Name} {p.Value.GetDouble():0}")) : "";
+        summary.ToolTip = "Searched: " + string.Join("; ", scan.A("roots").Select(r => r.GetString())) +
+                          (found.Length > 0 ? "\nFound via: " + found : "");
         if (tab == "status") RenderStatus(); else RenderSpace();
         if (list.Children.Count == 0)
             list.Children.Add(T("No git repositories found. Add folders in ⚙ settings.", 13, Dim, wrap: true));
+        ScheduleFit();
     }
 
-    static (string, Color) MainChip(JsonElement r)
+    static string Norm(string p) => p.Replace('/', '\\').TrimEnd('\\').ToLowerInvariant();
+    static bool IsWorktree(JsonElement r) => r.S("kind") == "worktree";
+    static bool NeedsAttention(JsonElement r) => r.Has("error") || r.A("attention").Any();
+
+    /// <summary>Main repos, each followed by its linked worktrees.</summary>
+    List<JsonElement> Ordered()
     {
-        var d = r.S("default", "main");
-        return r.S("main_state") switch
+        var repos = scan.A("repos").ToList();
+        var children = repos.Where(IsWorktree).GroupBy(r => Norm(r.S("parent"))).ToDictionary(g => g.Key, g => g.ToList());
+        var ordered = new List<JsonElement>();
+        foreach (var m in repos.Where(r => !IsWorktree(r)).OrderBy(r => r.S("name"), StringComparer.OrdinalIgnoreCase))
         {
-            "in_sync" => ($"{d} in sync", Good),
-            "behind" => ($"{d} behind {r.N("behind")}", Info),
-            "ahead" => ($"{d} ahead {r.N("ahead")}", Warn),
-            "diverged" => ($"{d} diverged ↑{r.N("ahead")} ↓{r.N("behind")}", Bad),
-            "no_remote" => ("no remote", Muted),
-            _ => ("no main branch", Muted),
-        };
+            ordered.Add(m);
+            if (children.Remove(Norm(m.S("path")), out var w)) ordered.AddRange(w.OrderBy(x => x.S("name"), StringComparer.OrdinalIgnoreCase));
+        }
+        foreach (var orphans in children.Values) ordered.AddRange(orphans);
+        return ordered;
     }
+
+    static Color DotColor(JsonElement r)
+    {
+        if (r.Has("error") || r.Has("fetch_error") || r.S("main_state") == "diverged" || r.O("dirty").N("conflicted") > 0) return Bad;
+        if (r.O("dirty").N("total") > 0 || r.S("main_state") == "ahead" || r.N("branch_ahead") > 0 || r.A("unpushed_branches").Any()) return Warn;
+        if (r.S("main_state") == "behind" || r.N("branch_behind") > 0 || r.N("stashes") > 0) return Info;
+        return Good;
+    }
+
+    static System.Windows.Shapes.Ellipse Dot(Color c, double left = 0) => new()
+    {
+        Width = 8, Height = 8, Fill = new SolidColorBrush(c), Margin = new Thickness(left, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center,
+    };
+
+    static TextBlock Section(string text) { var t = T(text.ToUpperInvariant(), 10, Dim, bold: true); t.Margin = new Thickness(2, 4, 0, 4); return t; }
+
+    void Toggle(HashSet<string> set, string key) { if (!set.Remove(key)) set.Add(key); Render(); }
 
     void RenderStatus()
     {
-        foreach (var r in scan.A("repos"))
+        var ordered = Ordered();
+        var needs = ordered.Where(NeedsAttention).ToList();
+        var healthy = ordered.Where(r => !NeedsAttention(r)).ToList();
+        if (needs.Count > 0)
         {
-            var path = r.S("path");
-            var body = new StackPanel();
-            var head = Row(T(r.S("name"), 14, Text, bold: true));
-            head.Children.Add(new TextBlock { Width = 8 });
-            if (r.Has("error"))
-            {
-                head.Children.Add(Chip("error", Bad));
-                body.Children.Add(head);
-                body.Children.Add(T(r.S("error"), 12, Dim, wrap: true));
-                body.Children.Add(T(path, 11, Dim));
-                list.Children.Add(Card(body));
-                continue;
-            }
-            var (label, color) = MainChip(r);
-            head.Children.Add(Chip(label, color));
-            var dirty = r.O("dirty");
-            if (dirty.N("total") > 0) head.Children.Add(Chip($"{dirty.N("total")} changed", Warn));
-            if (r.N("stashes") > 0) head.Children.Add(Chip($"{r.N("stashes")} stash", Info));
-            body.Children.Add(head);
-
-            var fetched = r.D("fetched_age_h");
-            var meta = $"{(r.Has("branch") ? "on " + r.S("branch") : "detached HEAD")} · last commit {J.Ago(r.N("last_commit"))} · " +
-                       (fetched == null ? "never fetched" : $"fetched {(fetched < 1 ? "<1 h" : $"{fetched:0} h")} ago");
-            body.Children.Add(T(meta, 11, Dim));
-            foreach (var note in r.EnumerateNotes())
-                body.Children.Add(T("• " + note, 12, Br("#F5C86B"), wrap: true));
-
-            var actions = Row();
-            actions.Margin = new Thickness(0, 6, 0, 0);
-            if (dirty.N("total") > 0)
-                actions.Children.Add(Pill(expanded.Contains(path) ? "Hide diff" : "Diff", () =>
-                {
-                    if (!expanded.Remove(path)) expanded.Add(path);
-                    Render();
-                    return Task.CompletedTask;
-                }));
-            bool unpushed = r.A("unpushed_branches").Any() || r.N("stashes") > 0;
-            if (dirty.N("total") > 0 || unpushed)
-                actions.Children.Add(Pill("Backup", () => Backup(r), tip: "Copy dirty files and bundle unpushed commits/stashes. Changes nothing in the repo."));
-            if (r.S("main_state") == "behind")
-                actions.Children.Add(Pill("Sync", () => Sync(r, false), primary: true, tip: "Fast-forward only. Never merges or rebases."));
-            if (r.S("main_state") == "ahead")
-                actions.Children.Add(Pill("Push", () => Sync(r, true), tip: "Push without force."));
-            actions.Children.Add(Pill("Open", () => { OpenFolder(path); return Task.CompletedTask; }));
-            body.Children.Add(actions);
-
-            if (expanded.Contains(path)) body.Children.Add(FileList(r));
-            list.Children.Add(Card(body));
+            list.Children.Add(Section($"Needs attention · {needs.Count}"));
+            var panel = new StackPanel();
+            foreach (var r in needs) panel.Children.Add(RepoRow(r));
+            list.Children.Add(Card(panel));
         }
+        if (healthy.Count > 0)
+        {
+            list.Children.Add(Section($"All good · {healthy.Count}"));
+            var wrap = new WrapPanel { Margin = new Thickness(0, 0, 0, 6) };
+            foreach (var r in healthy) wrap.Children.Add(Tile(r));
+            list.Children.Add(wrap);
+            foreach (var r in healthy.Where(r => expanded.Contains(r.S("path"))))
+            {
+                var panel = new StackPanel();
+                panel.Children.Add(RepoRow(r));
+                list.Children.Add(Card(panel));
+            }
+        }
+    }
+
+    UIElement RepoRow(JsonElement r)
+    {
+        var path = r.S("path");
+        var wt = IsWorktree(r);
+        var name = Row(Dot(DotColor(r), wt ? 14 : 0), T((wt ? "⎇ " : "") + r.S("name"), 13, Text, bold: !wt));
+        var branch = r.S("branch");
+        if (wt) name.Children.Add(T("  " + r.S("parent_name") + (branch.Length > 0 ? " · " + branch : ""), 11, Dim));
+        else if (branch.Length > 0 && branch != r.S("default")) name.Children.Add(T("  " + branch, 11, Dim));
+        name.Margin = new Thickness(0);
+
+        var chips = StateChips(r);
+        var line = new DockPanel { Background = Brushes.Transparent, Cursor = Cursors.Hand, MinHeight = 24, Margin = new Thickness(0, 1, 0, 1) };
+        var notes = r.Has("error") ? new List<string> { r.S("error") } : r.EnumerateNotes().ToList();
+        if (notes.Count > 0) line.ToolTip = string.Join("\n", notes);
+        DockPanel.SetDock(chips, Dock.Right);
+        line.Children.Add(chips);
+        line.Children.Add(name);
+        line.MouseLeftButtonDown += (_, e) => e.Handled = true;
+        line.MouseLeftButtonUp += (_, _) => Toggle(expanded, path);
+
+        var box = new StackPanel();
+        box.Children.Add(line);
+        if (expanded.Contains(path))
+        {
+            var details = Details(r);
+            details.Margin = new Thickness(wt ? 30 : 16, 2, 0, 8);
+            box.Children.Add(details);
+        }
+        return box;
+    }
+
+    static StackPanel StateChips(JsonElement r)
+    {
+        var chips = Row();
+        chips.Margin = new Thickness(0);
+        if (r.Has("error")) { chips.Children.Add(Chip("error", Bad)); return chips; }
+        if (r.Has("fetch_error")) chips.Children.Add(Chip("fetch failed", Bad));
+        var d = r.S("default", "main");
+        switch (r.S("main_state"))
+        {
+            case "behind": chips.Children.Add(Chip($"{d} ↓{r.N("behind")}", Info)); break;
+            case "ahead": chips.Children.Add(Chip($"{d} ↑{r.N("ahead")}", Warn)); break;
+            case "diverged": chips.Children.Add(Chip($"{d} ↑{r.N("ahead")} ↓{r.N("behind")}", Bad)); break;
+            case "no_remote": chips.Children.Add(Chip("local only", Muted)); break;
+        }
+        long ba = r.N("branch_ahead"), bb = r.N("branch_behind");
+        var onOther = r.S("branch").Length > 0 && (IsWorktree(r) || r.S("branch") != d);
+        if (onOther && (ba > 0 || bb > 0))
+            chips.Children.Add(Chip((ba > 0 ? $"↑{ba}" : "") + (ba > 0 && bb > 0 ? " " : "") + (bb > 0 ? $"↓{bb}" : ""), ba > 0 && bb > 0 ? Bad : ba > 0 ? Warn : Info));
+        var dirty = r.O("dirty");
+        if (dirty.N("conflicted") > 0) chips.Children.Add(Chip($"{dirty.N("conflicted")} conflict", Bad));
+        else if (dirty.N("total") > 0) chips.Children.Add(Chip($"✎ {dirty.N("total")}", Warn));
+        var otherUnpushed = r.A("unpushed_branches").Count(b => b.S("name") != r.S("branch") && b.S("name") != d);
+        if (otherUnpushed > 0) chips.Children.Add(Chip($"⎇ {otherUnpushed} unpushed", Warn));
+        if (r.N("stashes") > 0) chips.Children.Add(Chip($"≡ {r.N("stashes")}", Info));
+        if (!r.B("fresh") && r.Has("remote") && !IsWorktree(r)) chips.Children.Add(Chip("stale", Muted));
+        return chips;
+    }
+
+    Border Tile(JsonElement r)
+    {
+        var path = r.S("path");
+        var wt = IsWorktree(r);
+        var open = expanded.Contains(path);
+        var tile = new Border
+        {
+            Background = open ? Br("#4089E6D5") : Ui.Panel, CornerRadius = new CornerRadius(9), Padding = new Thickness(8, 3, 10, 4),
+            Margin = new Thickness(0, 0, 6, 6), Cursor = Cursors.Hand, BorderBrush = Line, BorderThickness = new Thickness(1),
+            Child = Row(Dot(DotColor(r)), T((wt ? "⎇ " : "") + r.S("name"), 12)),
+            ToolTip = $"{path}\n{(r.Has("branch") ? "on " + r.S("branch") : "detached HEAD")} · last commit {J.Ago(r.N("last_commit"))}" +
+                      (wt ? $"\nworktree of {r.S("parent_name")}" : ""),
+        };
+        ((StackPanel)tile.Child).Margin = new Thickness(0);
+        tile.MouseLeftButtonDown += (_, e) => e.Handled = true;
+        tile.MouseLeftButtonUp += (_, _) => Toggle(expanded, path);
+        return tile;
+    }
+
+    StackPanel Details(JsonElement r)
+    {
+        var path = r.S("path");
+        var body = new StackPanel();
+        if (r.Has("error"))
+        {
+            body.Children.Add(T(r.S("error"), 12, Dim, wrap: true));
+            body.Children.Add(T(path, 11, Dim));
+            return body;
+        }
+        var fetched = r.D("fetched_age_h");
+        var meta = $"{(r.Has("branch") ? "on " + r.S("branch") : "detached HEAD")} · last commit {J.Ago(r.N("last_commit"))} · " +
+                   (fetched == null ? "never fetched" : $"fetched {(fetched < 1 ? "<1 h" : $"{fetched:0} h")} ago");
+        body.Children.Add(T(meta, 11, Dim));
+        body.Children.Add(T(path, 11, Dim));
+        foreach (var note in r.EnumerateNotes())
+            body.Children.Add(T("• " + note, 12, Br("#F5C86B"), wrap: true));
+
+        var dirty = r.O("dirty");
+        var actions = Row();
+        actions.Margin = new Thickness(0, 6, 0, 0);
+        if (dirty.N("total") > 0)
+            actions.Children.Add(Pill(diffOpen.Contains(path) ? "Hide files" : "Files", () => { Toggle(diffOpen, path); return Task.CompletedTask; }));
+        bool unpushed = r.A("unpushed_branches").Any() || r.N("stashes") > 0 || r.N("branch_ahead") > 0;
+        if (dirty.N("total") > 0 || unpushed)
+            actions.Children.Add(Pill("Backup", () => Backup(r), tip: "Copy dirty files and bundle unpushed commits/stashes. Changes nothing in the repo."));
+        if (r.S("main_state") == "behind")
+            actions.Children.Add(Pill("Sync", () => Sync(r, false), primary: true, tip: "Fast-forward only. Never merges or rebases."));
+        if (r.S("main_state") == "ahead")
+            actions.Children.Add(Pill("Push", () => Sync(r, true), tip: "Push without force."));
+        actions.Children.Add(Pill("Open", () => { OpenFolder(path); return Task.CompletedTask; }));
+        body.Children.Add(actions);
+        if (diffOpen.Contains(path)) body.Children.Add(FileList(r));
+        return body;
     }
 
     UIElement FileList(JsonElement r)
     {
-        var panel = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
+        var panel = new StackPanel { Margin = new Thickness(0, 6, 0, 0) };
         var dirty = r.O("dirty");
         foreach (var f in dirty.A("files"))
         {
             var kind = f.S("kind");
             var mark = kind switch { "untracked" => "?", "deleted" => "D", "added" => "A", "conflicted" => "!", _ => "M" };
-            var row = new DockPanel { Margin = new Thickness(0, 1, 0, 1), Cursor = Cursors.Hand, Background = Brushes.Transparent };
+            var row = new DockPanel { Margin = new Thickness(0, 1, 0, 1), Cursor = Cursors.Hand, Background = Brushes.Transparent, ToolTip = "Show diff" };
             var stats = new StackPanel { Orientation = Orientation.Horizontal };
             if (f.Has("added")) stats.Children.Add(T($"+{f.N("added")} ", 11, new SolidColorBrush(Good)));
             if (f.Has("removed")) stats.Children.Add(T($"−{f.N("removed")}", 11, new SolidColorBrush(Bad)));
@@ -242,23 +390,27 @@ public sealed class MainWindow : Window
         toolbar.Margin = new Thickness(0, 0, 0, 8);
         list.Children.Add(toolbar);
 
-        foreach (var r in scan.A("repos").Where(r => !r.Has("error")))
-            AddGroup(r.S("name"), r.S("path"), r.A("items"),
-                     $"{J.Human(r.N("worktree_bytes"))} files · {J.Human(r.N("git_bytes"))} .git");
+        int groups = 0;
+        foreach (var r in Ordered().Where(r => !r.Has("error")))
+        {
+            var meta = IsWorktree(r) ? $"worktree of {r.S("parent_name")}" : $"{J.Human(r.N("worktree_bytes"))} files · {J.Human(r.N("git_bytes"))} .git";
+            if (AddGroup((IsWorktree(r) ? "⎇ " : "") + r.S("name"), r.S("path"), r.A("items"), meta)) groups++;
+        }
         var caches = scan.A("caches").ToList();
-        if (caches.Count > 0) AddGroup("Global package caches", "", caches, "outside repositories");
+        if (caches.Count > 0 && AddGroup("Global package caches", "", caches, "outside repositories")) groups++;
+        if (groups == 0) list.Children.Add(T("Nothing to reclaim right now.", 13, Dim));
     }
 
-    void AddGroup(string name, string key, IEnumerable<JsonElement> items, string meta)
+    bool AddGroup(string name, string key, IEnumerable<JsonElement> items, string meta)
     {
         var all = items.ToList();
         var offer = all.Where(i => i.S("status") != "keep").OrderByDescending(i => i.N("bytes")).ToList();
+        if (offer.Count == 0) return false;
         var kept = all.Count - offer.Count;
-        if (offer.Count == 0) return;
         var body = new StackPanel();
-        var head = Row(T(name, 14, Text, bold: true));
-        head.Children.Add(new TextBlock { Width = 8 });
-        head.Children.Add(T(meta, 11, Dim));
+        var head = Row(T(name, 13, Text, bold: true), T("  " + meta + (kept > 0 ? $" · {kept} kept" : ""), 11, Dim));
+        head.Margin = new Thickness(0, 0, 0, 2);
+        if (kept > 0) head.ToolTip = "Kept automatically: default branch, unpushed or uncommitted work, tracked files";
         body.Children.Add(head);
         foreach (var it in offer)
         {
@@ -267,16 +419,14 @@ public sealed class MainWindow : Window
             var box = new CheckBox
             {
                 IsChecked = selected.TryGetValue(key, out var set) && set.Contains(id),
-                VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, 3, 8, 0),
+                VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0),
             };
             box.Checked += (_, _) => { Sel(key).Add(id); UpdateCleanLabel(); };
             box.Unchecked += (_, _) => { Sel(key).Remove(id); UpdateCleanLabel(); };
-            var text = new StackPanel();
-            var line = Row(Chip(safe ? "Safe" : "Review", safe ? Good : Warn), T(KindLabel(it), 12, Dim), T(" " + it.S("target"), 12));
-            text.Children.Add(line);
-            text.Children.Add(T(it.S("reason"), 11, Dim, wrap: true));
             var size = T(it.N("bytes") > 0 ? J.Human(it.N("bytes")) : "", 12, Text, bold: true);
-            var row = new DockPanel { Margin = new Thickness(0, 6, 0, 0) };
+            var text = Row(Chip(safe ? "Safe" : "Review", safe ? Good : Warn), T(KindLabel(it) + " ", 12, Dim), T(it.S("target"), 12));
+            text.Margin = new Thickness(0);
+            var row = new DockPanel { Margin = new Thickness(0, 1, 0, 1), ToolTip = it.S("reason"), Background = Brushes.Transparent };
             DockPanel.SetDock(box, Dock.Left);
             DockPanel.SetDock(size, Dock.Right);
             row.Children.Add(box);
@@ -284,8 +434,8 @@ public sealed class MainWindow : Window
             row.Children.Add(text);
             body.Children.Add(row);
         }
-        if (kept > 0) body.Children.Add(T($"{kept} item(s) kept automatically (default branch, unpushed or uncommitted work, tracked files)", 11, Dim, wrap: true));
         list.Children.Add(Card(body));
+        return true;
     }
 
     static string KindLabel(JsonElement it) => it.S("kind") switch

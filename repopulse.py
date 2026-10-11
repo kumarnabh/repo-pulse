@@ -14,27 +14,31 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import shutil
+import urllib.parse
 import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 IS_WIN = os.name == "nt"
 FRESH_HOURS = 24
 GC_THRESHOLD = 50 * 1024 * 1024
-MAX_DEPTH = 5
+MAX_DEPTH = 6
 JUNK_DEPTH = 6
 DIFF_FILES = 60
 DIFF_TEXT_LIMIT = 200_000
 
 SKIP_WALK = {
     "node_modules", ".venv", "venv", "__pycache__", ".git", "$recycle.bin",
-    "system volume information", "windows", "program files", "program files (x86)",
-    "programdata", "appdata", "library", ".cache", ".npm", ".nuget", ".gradle",
-    ".cargo", ".rustup", "anaconda3", "miniconda3",
+    "system volume information", "windows", "windows.old", "program files", "program files (x86)",
+    "programdata", "appdata", "perflogs", "recovery", "msocache", "windowsapps", "xboxgames",
+    "steamapps", ".cache", ".npm", ".nuget", ".gradle", ".cargo", ".rustup", ".pyenv",
+    "anaconda3", "miniconda3", "site-packages", "dist-packages", ".vscode", ".vscode-server",
+    ".cursor", "onedrivetemp",
 }
 PY_MANIFESTS = ["pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "Pipfile", "poetry.lock", "uv.lock"]
 NODE = ["package.json"]
@@ -181,8 +185,25 @@ def expand(p: str) -> Path | None:
     return Path(os.path.expanduser(os.path.expandvars(p)))
 
 
+def fixed_drives() -> list[str]:
+    if not IS_WIN:
+        return []
+    import ctypes
+    import string
+    k32 = ctypes.windll.kernel32
+    mask = k32.GetLogicalDrives()
+    drives = []
+    for i, letter in enumerate(string.ascii_uppercase):
+        if mask >> i & 1:
+            root = f"{letter}:\\"
+            if k32.GetDriveTypeW(root) == 3:  # DRIVE_FIXED: skips network, removable and optical drives
+                drives.append(root)
+    return drives
+
+
 def default_roots() -> list[str]:
-    return [str(Path.home())]
+    """Every fixed drive on Windows (system folders are skipped while walking); the home folder elsewhere."""
+    return fixed_drives() or [str(Path.home())]
 
 
 def backup_root(dest: str | None) -> Path:
@@ -191,9 +212,95 @@ def backup_root(dest: str | None) -> Path:
 
 # ---------------------------------------------------------------- discovery
 
-def discover(roots: list[str], max_depth: int = MAX_DEPTH) -> list[str]:
-    found: list[str] = []
-    seen: set[str] = set()
+def git_kind(folder: str) -> str | None:
+    """'repo' for a main worktree, 'worktree' for a linked worktree, None otherwise (incl. submodules)."""
+    dotgit = os.path.join(folder, ".git")
+    if os.path.isdir(dotgit):
+        return "repo"
+    if os.path.isfile(dotgit):
+        try:
+            with open(dotgit, encoding="utf-8", errors="replace") as fh:
+                target = fh.read(4096).strip().replace("\\", "/")
+        except OSError:
+            return None
+        if target.startswith("gitdir:") and "/worktrees/" in target:
+            return "worktree"
+    return None
+
+
+def hint_paths() -> list[tuple[str, str]]:
+    """Folders other tools already know about: Claude Code, Codex, VS Code family."""
+    hints: list[tuple[str, str]] = []
+    home = Path.home()
+    try:
+        data = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
+        hints += [(p, "Claude Code") for p in (data.get("projects") or {}) if isinstance(p, str)]
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        text = (home / ".codex" / "config.toml").read_text(encoding="utf-8")
+        for quote, key in re.findall(r'^\s*\[projects\.(["\'])(.+?)\1\]', text, re.M):
+            hints.append((key.replace("\\\\", "\\") if quote == '"' else key, "Codex"))
+    except OSError:
+        pass
+    base = os.environ.get("APPDATA")
+    for app in ("Code", "Cursor", "Windsurf", "Code - Insiders"):
+        f = Path(base, app) if base else home / ".config" / app
+        f = f / "User" / "globalStorage" / "storage.json"
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for uri in _file_uris(data):
+            path = urllib.parse.unquote(uri[len("file://"):])
+            if IS_WIN and re.match(r"^/[A-Za-z]:", path):
+                path = path[1:]
+            hints.append((path, app))
+    return hints
+
+
+def _file_uris(node) -> list[str]:
+    out = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            out += _file_uris(k) + _file_uris(v)
+    elif isinstance(node, list):
+        for v in node:
+            out += _file_uris(v)
+    elif isinstance(node, str) and node.startswith("file:///"):
+        out.append(node)
+    return out
+
+
+def enclosing_git(path: str) -> tuple[str, str] | None:
+    p = os.path.abspath(os.path.expanduser(path))
+    for _ in range(12):
+        if os.path.isdir(p):
+            kind = git_kind(p)
+            if kind:
+                return p, kind
+        parent = os.path.dirname(p)
+        if parent == p:
+            return None
+        p = parent
+    return None
+
+
+def linked_worktrees(repo_path: str) -> list[str]:
+    out = git_ok(repo_path, "worktree", "list", "--porcelain") or ""
+    paths = [line[9:] for line in out.splitlines() if line.startswith("worktree ")]
+    return [os.path.normpath(p) for p in paths[1:] if os.path.isdir(p) and git_kind(p) == "worktree"]
+
+
+def discover(roots: list[str], max_depth: int = MAX_DEPTH, hints: bool = True) -> list[dict]:
+    """Main repos and linked worktrees under the roots, from tool history, and from each repo's worktree list."""
+    found: dict[str, dict] = {}
+
+    def add(path: str, kind: str, source: str) -> None:
+        key = os.path.normcase(os.path.realpath(path))
+        if key not in found:
+            found[key] = {"path": os.path.normpath(path), "kind": kind, "source": source}
+
     for root in roots:
         root = os.path.abspath(os.path.expanduser(root))
         if not os.path.isdir(root):
@@ -201,12 +308,9 @@ def discover(roots: list[str], max_depth: int = MAX_DEPTH) -> list[str]:
         stack = [(root, 0)]
         while stack:
             current, depth = stack.pop()
-            dotgit = os.path.join(current, ".git")
-            if os.path.isdir(dotgit):  # main worktree; .git files are linked worktrees/submodules
-                key = os.path.normcase(os.path.realpath(current))
-                if key not in seen:
-                    seen.add(key)
-                    found.append(current)
+            kind = git_kind(current)
+            if kind:
+                add(current, kind, "folders")
             if depth >= max_depth:
                 continue
             try:
@@ -223,7 +327,15 @@ def discover(roots: list[str], max_depth: int = MAX_DEPTH) -> list[str]:
                         stack.append((e.path, depth + 1))
             except OSError:
                 continue
-    return sorted(found, key=lambda p: p.lower())
+    if hints:
+        for path, source in hint_paths():
+            hit = enclosing_git(path)
+            if hit:
+                add(hit[0], hit[1], source)
+    for entry in [e for e in found.values() if e["kind"] == "repo"]:
+        for wt in linked_worktrees(entry["path"]):
+            add(wt, "worktree", "worktree list")
+    return sorted(found.values(), key=lambda e: e["path"].lower())
 
 
 # ---------------------------------------------------------------- repo facts
@@ -527,8 +639,13 @@ def scan_repo(path: str, do_fetch: bool = False) -> dict:
         repo = Repo(path)
     except RuntimeError as exc:
         return {"path": path, "name": os.path.basename(path), "error": str(exc)}
-    result: dict = {"path": repo.path, "name": repo.name, "remote": repo.remote, "default": repo.default}
-    if do_fetch:
+    is_wt = git_kind(repo.path) == "worktree"
+    result: dict = {"path": repo.path, "name": repo.name, "remote": repo.remote, "default": repo.default,
+                    "kind": "worktree" if is_wt else "repo"}
+    if is_wt:
+        parent = os.path.normpath(os.path.dirname(repo.git_dir.rstrip("/\\")))
+        result.update(parent=parent, parent_name=os.path.basename(parent))
+    if do_fetch and not is_wt:
         result["fetch_error"] = repo.fetch()
     result["fetched_age_h"] = repo.fetched_age_h()
     result["fresh"] = repo.fresh()
@@ -536,10 +653,23 @@ def scan_repo(path: str, do_fetch: bool = False) -> dict:
     result["branch"] = cur.strip() if cur else None
     result["detached"] = cur is None and repo.has_head
 
+    # current branch vs its upstream
+    up = git_ok(repo.path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}") if cur else None
+    result["upstream"] = up.strip() if up else None
+    b_ahead = b_behind = 0
+    if result["upstream"]:
+        out = git_ok(repo.path, "rev-list", "--left-right", "--count", "HEAD...@{u}") or "0\t0"
+        b_ahead, b_behind = (int(x) for x in out.split())
+    elif repo.has_head and repo.remote:
+        b_ahead = repo.unpushed("HEAD") or 0
+    result.update(branch_ahead=b_ahead, branch_behind=b_behind)
+
     # main vs origin/main
     d, r = repo.default, repo.remote
     state, ahead, behind = "no_main", 0, 0
-    if d and repo.ref_exists(f"refs/heads/{d}"):
+    if is_wt:
+        state = "worktree"
+    elif d and repo.ref_exists(f"refs/heads/{d}"):
         if not r or not repo.ref_exists(f"refs/remotes/{r}/{d}"):
             state = "no_remote"
         else:
@@ -566,11 +696,12 @@ def scan_repo(path: str, do_fetch: bool = False) -> dict:
     stash = git_ok(repo.path, "stash", "list") or ""
     result["stashes"] = len([l for l in stash.splitlines() if l.strip()])
 
-    trees = repo.worktrees()
-    items = classify_branches(repo, trees) + classify_worktrees(repo, trees)
+    # branches, worktrees and git garbage belong to the main repository row only
+    trees = [] if is_wt else repo.worktrees()
+    items = [] if is_wt else classify_branches(repo, trees) + classify_worktrees(repo, trees)
     junk, wt_bytes = find_junk(repo)
     items += junk
-    g = gc_item(repo)
+    g = None if is_wt else gc_item(repo)
     if g:
         items.append(g)
     for it in items:
@@ -580,7 +711,7 @@ def scan_repo(path: str, do_fetch: bool = False) -> dict:
                                    if b["kind"] == "branch" and b.get("unpushed")]
     result["worktrees"] = len([t for t in trees if not t["main"]])
     result["worktree_bytes"] = wt_bytes
-    result["git_bytes"] = dir_size(repo.git_dir)
+    result["git_bytes"] = 0 if is_wt else dir_size(repo.git_dir)
     result["safe_bytes"] = sum(i["bytes"] for i in items if i["status"] == "safe")
     result["review_bytes"] = sum(i["bytes"] for i in items if i["status"] == "review")
     result["attention"] = attention(result)
@@ -592,6 +723,14 @@ def attention(r: dict) -> list[str]:
     notes = []
     if r.get("fetch_error"):
         notes.append(f"Fetch failed: {r['fetch_error']}")
+    b = r.get("branch")
+    if r["main_state"] == "worktree" or (b and b != r.get("default")):
+        if b and r.get("upstream") and r["branch_ahead"] and r["branch_behind"]:
+            notes.append(f"{b} diverged from {r['upstream']}: {r['branch_ahead']} ahead, {r['branch_behind']} behind")
+        elif b and r.get("upstream") and r["branch_behind"]:
+            notes.append(f"{b} is {r['branch_behind']} behind {r['upstream']}")
+        elif b and r["branch_ahead"]:
+            notes.append(f"{b} has {r['branch_ahead']} unpushed commit(s)" + ("" if r.get("upstream") else " (never pushed)"))
     if r["main_state"] == "diverged":
         notes.append(f"{r['default']} diverged: {r['ahead']} ahead, {r['behind']} behind")
     elif r["main_state"] == "behind":
@@ -602,12 +741,12 @@ def attention(r: dict) -> list[str]:
         notes.append(f"{r['dirty']['conflicted']} conflicted file(s)")
     if r["dirty"].get("total"):
         notes.append(f"{r['dirty']['total']} uncommitted change(s)")
-    others = [b for b in r["unpushed_branches"] if b["name"] != r.get("default")]
+    others = [x for x in r["unpushed_branches"] if x["name"] not in (r.get("default"), b)]
     if others:
         notes.append(f"{len(others)} other branch(es) with unpushed work")
     if r["stashes"]:
         notes.append(f"{r['stashes']} stash(es)")
-    if r.get("remote") and not r.get("fresh"):
+    if r.get("remote") and not r.get("fresh") and r["main_state"] != "worktree":
         notes.append("Not fetched in 24 h")
     return notes
 
@@ -627,30 +766,64 @@ def scan_caches() -> list[dict]:
 
 
 def cmd_scan(args) -> dict:
+    started = now()
     roots = [r for r in (args.roots or "").split(";") if r.strip()] or default_roots()
-    repos = [p for p in (args.repo or [])] or discover(roots, args.depth)
+    if args.repo:
+        entries = [{"path": os.path.normpath(p), "kind": git_kind(p) or "repo", "source": "argument"} for p in args.repo]
+    else:
+        entries = discover(roots, args.depth, hints=not args.no_hints)
+    workers = max(1, min(8, len(entries)))
+    fetch_errors: dict[str, str | None] = {}
+    if args.fetch:  # fetch every main repo first, so worktrees read fresh refs
+        mains = [e["path"] for e in entries if e["kind"] == "repo"]
+        with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+            for path, err in zip(mains, pool.map(_fetch_one, mains)):
+                fetch_errors[os.path.normcase(path)] = err
     results = []
-    with cf.ThreadPoolExecutor(max_workers=max(1, min(8, len(repos)))) as pool:
-        futures = {pool.submit(scan_repo, p, args.fetch): p for p in repos}
+    with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(scan_repo, e["path"]): e for e in entries}
         for fut in cf.as_completed(futures):
+            e = futures[fut]
             try:
-                results.append(fut.result())
+                r = fut.result()
             except Exception as exc:  # one broken repo must not fail the scan
-                results.append({"path": futures[fut], "name": os.path.basename(futures[fut]), "error": str(exc)})
-    results.sort(key=lambda r: (not r.get("attention"), r["name"].lower()))
+                r = {"path": e["path"], "name": os.path.basename(e["path"]), "error": str(exc)}
+            r["source"] = e["source"]
+            err = fetch_errors.get(os.path.normcase(e["path"]))
+            if err and not r.get("error"):
+                r["fetch_error"] = err
+                r["attention"] = attention(r)
+            results.append(r)
+    results.sort(key=lambda r: (not r.get("attention"), (r.get("parent_name") or r["name"]).lower(), r.get("kind") == "worktree", r["name"].lower()))
     caches = scan_caches() if args.caches else []
     ok = [r for r in results if not r.get("error")]
+    # a worktree row's folders are already inside a Safe worktree item of its main repo: count them once
+    safe_trees = {os.path.normcase(os.path.normpath(i["target"])) for r in ok for i in r["items"]
+                  if i["kind"] == "worktree" and i["status"] == "safe"}
+    counted = [r for r in ok if os.path.normcase(r["path"]) not in safe_trees]
+    sources: dict[str, int] = {}
+    for r in results:
+        sources[r["source"]] = sources.get(r["source"], 0) + 1
     return {
         "ok": True, "version": VERSION, "scanned_at": int(now()), "roots": roots, "repos": results, "caches": caches,
+        "sources": sources, "scan_ms": int((now() - started) * 1000),
         "totals": {
-            "repos": len(results),
+            "repos": len([r for r in results if r.get("kind") != "worktree"]),
+            "worktrees": len([r for r in results if r.get("kind") == "worktree"]),
             "needs_attention": len([r for r in ok if r["attention"]]),
-            "safe_bytes": sum(r["safe_bytes"] for r in ok) + sum(c["bytes"] for c in caches if c["status"] == "safe"),
-            "review_bytes": sum(r["review_bytes"] for r in ok) + sum(c["bytes"] for c in caches if c["status"] == "review"),
+            "safe_bytes": sum(r["safe_bytes"] for r in counted) + sum(c["bytes"] for c in caches if c["status"] == "safe"),
+            "review_bytes": sum(r["review_bytes"] for r in counted) + sum(c["bytes"] for c in caches if c["status"] == "review"),
             "worktree_bytes": sum(r["worktree_bytes"] for r in ok),
             "git_bytes": sum(r["git_bytes"] for r in ok),
         },
     }
+
+
+def _fetch_one(path: str) -> str | None:
+    try:
+        return Repo(path).fetch()
+    except RuntimeError as exc:
+        return str(exc)
 
 
 # ---------------------------------------------------------------- actions
@@ -917,6 +1090,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--depth", type=int, default=MAX_DEPTH)
     s.add_argument("--fetch", action="store_true", help="git fetch --prune first (updates remote-tracking refs only)")
     s.add_argument("--caches", action="store_true", help="Include global package caches")
+    s.add_argument("--no-hints", action="store_true", help="Ignore folders known to Claude Code, Codex and VS Code")
     b = sub.add_parser("backup", help="Copy dirty files and bundle unpushed commits")
     b.add_argument("--repo", required=True)
     b.add_argument("--dest")

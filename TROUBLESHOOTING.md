@@ -6,6 +6,12 @@ Install Python from python.org with the Python launcher (`py`). The Microsoft St
 **Build fails: `dotnet` not found**
 Install the .NET 8 SDK, open a new terminal, run `Build.cmd` again.
 
+**A repository is missing**
+Hover over the summary line to see which folders were searched and how each repository was found.
+If ⚙ settings list specific folders, only those (plus Claude Code / Codex / VS Code history and
+worktrees) are searched; clear the field to scan every fixed drive. Network and removable drives,
+and folders deeper than 6 levels below a root, are not walked; add them as roots.
+
 **A repo shows "Not a readable git repository"**
 Usually git's ownership check. Run `git config --global --add safe.directory <path>` if you trust that folder.
 
@@ -26,4 +32,8 @@ Large untracked assets (for example Blender files) exceed 2 GB. Commit or ignore
 `py -3 repopulse.py backup --repo <path> --max-gb 10`.
 
 **Scanning is slow**
-Point ⚙ settings at your code folders instead of the whole user folder.
+The first scan of every drive takes longest. Point ⚙ settings at your code folders to speed it up;
+tool-history folders and worktrees are still included.
+
+**The window is too tall or too short**
+It fits itself to the content. If you resized it by hand, double-click the header to fit again.
