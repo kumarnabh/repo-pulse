@@ -47,7 +47,8 @@ def by_target(scan, kind, target):
 
 class Fixture(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="repopulse-"))
+        # resolve() expands Windows 8.3 short names (RUNNER~1) so paths match what git reports
+        self.tmp = Path(tempfile.mkdtemp(prefix="repopulse-")).resolve()
         os.environ["REPOPULSE_TRASH"] = str(self.tmp / "backups")
         self.remote = self.tmp / "remote.git"
         g(self.tmp, "init", "-q", "--bare", str(self.remote))

@@ -22,7 +22,19 @@ jobs:
         with:
           python-version: "3.12"
       - name: Unit tests
-        run: python -m unittest discover -s tests -v
+        shell: python
+        run: |
+          import subprocess, sys
+          r = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"], capture_output=True, text=True)
+          out = r.stdout + r.stderr
+          print(out)
+          if r.returncode:
+              # Surface failures as annotations so they are readable without raw logs.
+              blocks = [b for b in out.split("=" * 70) if "FAIL:" in b or "ERROR:" in b] or [out[-6000:]]
+              for b in blocks[:10]:
+                  msg = b.strip()[:6000].replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+                  print(f"::error title=Test failure::{msg}")
+          sys.exit(r.returncode)
 
   widget:
     name: Widget build (Windows)
