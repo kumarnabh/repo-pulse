@@ -1,0 +1,121 @@
+# Repo Pulse — Specification
+
+Local git health and space manager for Windows. Same architecture as Prism:
+a .NET 8 WPF glass shell that calls a Python core which prints JSON.
+
+## Goals
+
+1. **Status**: for every local repo, show whether local `main` agrees with
+   `origin/main`, dirty files with a diff preview, unpushed commits and stashes.
+2. **Protect work**: one-click backup of dirty files and unpushed commits.
+3. **Sync safely**: fast-forward only. Push only without force.
+4. **Space**: find reclaimable space (merged/synced branches, stale worktrees,
+   rebuildable folders, git garbage) and remove it safely.
+
+Non-goals: merging, rebasing, conflict resolution, force-push, scheduled or
+automatic cleanup, anything requiring administrator rights.
+
+## Architecture
+
+| Layer | File | Role |
+|---|---|---|
+| Core | `repopulse.py` | Discovery, scan, classification, actions. Standard library only. Prints one JSON object per call. |
+| Shell | `source/*.cs` | WPF widget: Status and Space tabs, confirmations, calls the core. |
+| Data | `data/settings.json` | Scan roots, backup folder. No credentials. |
+
+Core commands:
+
+```
+repopulse.py scan    --roots "D:\Code;C:\Users\me\source" [--fetch] [--caches]
+repopulse.py backup  --repo PATH [--dest DIR]
+repopulse.py sync    --repo PATH [--push]
+repopulse.py clean   --repo PATH --ids ID1,ID2 [--allow-review] [--dest DIR]
+```
+
+`scan` never changes anything, except `--fetch`, which runs
+`git fetch --prune --no-tags origin` (it updates only remote-tracking refs).
+
+## Repo status
+
+| Field | Meaning |
+|---|---|
+| `main_state` | `in_sync`, `behind` (fast-forwardable), `ahead` (unpushed), `diverged`, `no_remote`, `no_main` |
+| `ahead` / `behind` | commit counts between local default branch and `origin/<default>` |
+| `dirty` | staged, modified, untracked, conflicted counts; `diff` = per-file +/− lines |
+| `unpushed_branches` | local branches whose commits exist on no remote |
+| `stashes` | stash count (stashes are never touched by cleanup) |
+| `fetched_age_h` | hours since the last fetch; status is stale beyond 24 h |
+
+## Safety classification
+
+Every cleanup item is **Safe**, **Review** or **Keep**. Only Safe items can be
+removed without `--allow-review`. Classification is recomputed immediately
+before execution; if an item changed since the scan, it is skipped.
+
+### Branches
+- **Keep**: the default branch; any branch checked out in any worktree; any branch
+  with commits not contained in a remote-tracking ref.
+- **Safe**: the tip is contained in `origin/<default>` or in its own upstream,
+  **and** the last fetch is under 24 hours old.
+- **Review**: contained in a remote but the fetch is stale; or the upstream is gone
+  and the commits are not on any remote (typical after a squash merge).
+- Before deletion, every branch is written to a `git bundle` in the backup
+  folder, so it can be restored with `git fetch <bundle> <branch>:<branch>`.
+
+### Worktrees
+- **Safe**: the directory is already missing (prunable metadata) → `git worktree prune`.
+- **Safe**: clean, not locked, and its HEAD is contained in a remote, with a fresh fetch.
+- **Keep**: dirty, locked, the main worktree, or HEAD has unpushed commits.
+- Removal uses `git worktree remove` without `--force`, so git itself refuses
+  dirty trees as a second guard.
+
+### Folders
+- **Safe**: a known rebuildable folder (`node_modules`, `.venv`, `__pycache__`,
+  `.next`, `bin/obj` next to a `.csproj`, `target` next to `Cargo.toml`, …) that
+  is git-ignored, has no tracked files, and whose manifest exists
+  (`package.json`, `pyproject.toml`/`requirements*.txt`, etc.).
+- **Review**: rebuildable-looking but not ignored, or the manifest is missing;
+  generic `dist`/`build`/`out` folders.
+- **Never**: anything containing tracked files.
+- Folders go to the Recycle Bin. Windows warns before permanently deleting
+  anything too large for the bin.
+
+### Git garbage
+- `git gc` (default prune window, never `--prune=now`) is Safe when loose or
+  garbage objects exceed 50 MB.
+
+## Backup
+
+Writes to `%USERPROFILE%\RepoPulse Backups\<repo>\<timestamp>\`:
+- every modified, staged and untracked (non-ignored) file, at its relative path;
+- `changes.patch` (`git diff HEAD --binary`) and `staged.patch`;
+- `unpushed.bundle` containing commits on no remote (skipped when there are none);
+- `manifest.json` with branch, HEAD, file list and restore instructions.
+
+The working tree is not modified.
+
+## Sync
+
+- Default branch behind and not diverged: fast-forward only. If it is checked out
+  in a clean worktree, `git merge --ff-only`; if not checked out, `git fetch . origin/main:main`.
+  Git refuses non-fast-forward updates in both paths.
+- `--push`: `git push origin <branch>` without force, only when ahead and not behind.
+- Diverged or dirty: no action; the UI shows the diff and the counts.
+
+## Repository discovery
+
+- Walks each root to depth 5, skipping AppData, package caches, dependency folders and system folders.
+- A folder with a `.git` directory is a repository. Folders with a `.git` file (linked worktrees,
+  submodules) are not listed separately; linked worktrees appear under their main repository.
+- Junk detection walks the main worktree to depth 6 and does not descend into nested repositories or worktrees.
+
+## Global caches (optional)
+
+npm, pip and Yarn caches are Safe (re-downloaded on demand). The pnpm store, NuGet packages
+and Playwright browsers are Review (rebuild needs the network or a prune command).
+
+## Acceptance
+
+- Scanner reports reclaimable bytes per repo and in total.
+- Zero false Safe flags in the fixture test suite (unpushed commits, stale fetch,
+  dirty worktree, tracked files inside junk folders, squash-merged branches).

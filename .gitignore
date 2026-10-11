@@ -1,0 +1,11 @@
+build/
+source/bin/
+source/obj/
+data/
+__pycache__/
+.venv/
+RepoPulse.exe
+RepoPulse.dll
+RepoPulse.pdb
+RepoPulse.deps.json
+RepoPulse.runtimeconfig.json
