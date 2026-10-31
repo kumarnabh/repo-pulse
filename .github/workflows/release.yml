@@ -59,7 +59,7 @@ jobs:
           m = re.search(rf"^## {re.escape(v)}\b.*?$(.*?)(?=^## |\Z)", text, re.M | re.S)
           notes = (m.group(1).strip() if m else f"See CHANGELOG.md for {v}.")
           notes += ("\n\n### Download\n"
-                    f"- **RepoPulse-{v}-win-x64.zip**: everything included; needs only Python 3.10+.\n"
+                    f"- **RepoPulse-{v}-win-x64.zip**: everything included; needs only Python 3.11+.\n"
                     f"- **RepoPulse-{v}-win-x64-needs-dotnet10.zip**: small download for machines with the .NET 10 Desktop Runtime.\n\n"
                     "Unzip, then run `Launch Repo Pulse.cmd`. Verify downloads with `SHA256SUMS.txt`.")
           open("notes.md", "w", encoding="utf-8").write(notes)

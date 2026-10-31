@@ -8,7 +8,7 @@ Compare the zip against `SHA256SUMS.txt` on the release page: `Get-FileHash Repo
 Keep `repopulse.py` next to `RepoPulse.exe`, and unzip to a folder you can write to (not `Program Files`),
 because settings are saved in `data\` beside the program.
 
-**"Python 3.10 or newer was not found"**
+**"Python 3.11 or newer was not found"**
 Install Python from python.org with the Python launcher (`py`). The Microsoft Store alias (`WindowsApps\python.exe`) is not used.
 
 **Build fails: `dotnet` not found**

@@ -104,9 +104,13 @@ def longp(path: str | Path) -> str:
     return p
 
 
+# core.longpaths: without it git for Windows silently skips paths over 260 characters (status, backup, diff)
+GIT_OPTS = ["-c", "core.quotepath=off", "-c", "color.ui=never"] + (["-c", "core.longpaths=true"] if IS_WIN else [])
+
+
 def git(repo: str | Path, *args: str, timeout: float = 60, stdin: bytes | None = None,
         extra_env: dict | None = None) -> tuple[int, str, str]:
-    cmd = ["git", "-C", str(repo), "-c", "core.quotepath=off", "-c", "color.ui=never", *args]
+    cmd = ["git", "-C", str(repo), *GIT_OPTS, *args]
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GCM_INTERACTIVE="never", LC_ALL="C", **(extra_env or {}))
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WIN else 0
     try:
@@ -119,7 +123,7 @@ def git(repo: str | Path, *args: str, timeout: float = 60, stdin: bytes | None =
 
 
 def git_bytes(repo: str | Path, *args: str, timeout: float = 60) -> tuple[int, bytes]:
-    cmd = ["git", "-C", str(repo), "-c", "core.quotepath=off", "-c", "color.ui=never", *args]
+    cmd = ["git", "-C", str(repo), *GIT_OPTS, *args]
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GCM_INTERACTIVE="never")
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WIN else 0
     try:
@@ -260,10 +264,74 @@ def file_sha256(path: str | Path) -> str:
     return h.hexdigest()
 
 
-def copy_verified(src: str, dst: Path) -> str:
+ENCRYPT_LIMIT = 512 * 1024 * 1024
+ENC_SUFFIX = ".dpapi"
+
+
+def _dpapi(data: bytes, protect: bool) -> bytes:
+    """Windows DPAPI, scoped to the current user: only this Windows account on this machine can decrypt."""
+    if not IS_WIN:
+        raise OSError("Encrypted backups use Windows DPAPI and are only available on Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    def blob(b: bytes):
+        buf = ctypes.create_string_buffer(b, len(b))
+        return BLOB(len(b), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), buf
+
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    inp, _keep1 = blob(data)
+    ent, _keep2 = blob(b"RepoPulse backup v1")
+    out = BLOB()
+    if protect:
+        fn = crypt32.CryptProtectData
+        fn.argtypes = [ctypes.POINTER(BLOB), wintypes.LPCWSTR, ctypes.POINTER(BLOB), ctypes.c_void_p, ctypes.c_void_p,
+                       wintypes.DWORD, ctypes.POINTER(BLOB)]
+        ok = fn(ctypes.byref(inp), "Repo Pulse backup", ctypes.byref(ent), None, None, 0x1, ctypes.byref(out))
+    else:
+        fn = crypt32.CryptUnprotectData
+        fn.argtypes = [ctypes.POINTER(BLOB), ctypes.c_void_p, ctypes.POINTER(BLOB), ctypes.c_void_p, ctypes.c_void_p,
+                       wintypes.DWORD, ctypes.POINTER(BLOB)]
+        ok = fn(ctypes.byref(inp), None, ctypes.byref(ent), None, None, 0x1, ctypes.byref(out))
+    if not ok:
+        raise OSError("Windows could not " + ("encrypt" if protect else "decrypt") + " the data (DPAPI error "
+                      f"{ctypes.GetLastError()}); it can only be decrypted by the same Windows account")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
+
+
+def encrypt_bytes(data: bytes) -> bytes:
+    return _dpapi(data, True)
+
+
+def decrypt_bytes(data: bytes) -> bytes:
+    return _dpapi(data, False)
+
+
+def read_backup_file(path: Path) -> bytes:
+    """Plain content of a backed-up file, decrypting a `.dpapi` copy when that is what exists."""
+    if not os.path.exists(longp(path)) and os.path.exists(longp(str(path) + ENC_SUFFIX)):
+        with open(longp(str(path) + ENC_SUFFIX), "rb") as fh:
+            return decrypt_bytes(fh.read())
+    with open(longp(path), "rb") as fh:
+        return fh.read()
+
+
+def copy_verified(src: str, dst: Path, encrypt: bool = False) -> str:
     """Copy one regular file and prove the copy: the copy must hash equal to the source, and the source
-    must not have changed while it was read. Raises OSError (the copy is removed) otherwise."""
+    must not have changed while it was read. Raises OSError (the copy is removed) otherwise.
+
+    encrypt=True writes `<dst>.dpapi` instead, and proves it by decrypting it again.
+    """
     os.makedirs(longp(dst.parent), exist_ok=True)
+    if encrypt:
+        return _copy_encrypted(src, Path(str(dst) + ENC_SUFFIX))
     h = hashlib.sha256()
     try:
         with open(longp(src), "rb") as fi, open(longp(dst), "xb") as fo:
@@ -288,7 +356,32 @@ def copy_verified(src: str, dst: Path) -> str:
         raise
 
 
-def copy_tree_verified(root: str, rel: str, dest_root: Path) -> tuple[dict[str, str], list[dict]]:
+def _copy_encrypted(src: str, dst: Path) -> str:
+    try:
+        if os.path.getsize(longp(src)) > ENCRYPT_LIMIT:
+            raise OSError(f"larger than {human(ENCRYPT_LIMIT)}; too large to encrypt")
+        with open(longp(src), "rb") as fh:
+            data = fh.read()
+        digest = hashlib.sha256(data).hexdigest()
+        with open(longp(dst), "xb") as fo:
+            fo.write(encrypt_bytes(data))
+            fo.flush()
+            os.fsync(fo.fileno())
+        with open(longp(dst), "rb") as fh:
+            if hashlib.sha256(decrypt_bytes(fh.read())).hexdigest() != digest:
+                raise OSError("the encrypted copy does not decrypt to the source")
+        if file_sha256(src) != digest:
+            raise OSError("the file changed while it was being copied")
+        return digest
+    except OSError:
+        try:
+            os.remove(longp(dst))
+        except OSError:
+            pass
+        raise
+
+
+def copy_tree_verified(root: str, rel: str, dest_root: Path, encrypt: bool = False) -> tuple[dict[str, str], list[dict]]:
     """copy_verified for a file or folder under root. Links are never followed: they are recorded."""
     hashes: dict[str, str] = {}
     problems: list[dict] = []
@@ -310,7 +403,7 @@ def copy_tree_verified(root: str, rel: str, dest_root: Path) -> tuple[dict[str, 
                 problems.append({"path": cur, "error": exc.strerror or str(exc)})
         elif stat.S_ISREG(st.st_mode):
             try:
-                hashes[cur.replace("\\", "/")] = copy_verified(full, dest_root / cur)
+                hashes[cur.replace("\\", "/")] = copy_verified(full, dest_root / cur, encrypt)
             except OSError as exc:
                 problems.append({"path": cur, "error": exc.strerror or str(exc)})
     return hashes, problems
@@ -337,16 +430,43 @@ def write_json_atomic(path: Path, data) -> None:
     os.replace(tmp, path)
 
 
+def new_op_id() -> str:
+    return dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
+
+
 def log_operation(dest: str | None, record: dict) -> None:
-    """Append one line to the operation history next to the backups. Never fails the action itself."""
+    """Append one line to the operation journal next to the backups. Never fails the action itself.
+
+    Destructive actions write a `started` line before they change anything and a `finished` line after,
+    so `recover` can find actions cut short by a crash, power loss or forced termination.
+    """
     try:
         root = backup_root(dest)
         root.mkdir(parents=True, exist_ok=True)
         line = json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "version": VERSION, **record}, ensure_ascii=False)
         with open(root / "operations.jsonl", "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
     except OSError:
         pass
+
+
+def read_operations(dest: str | None) -> list[dict]:
+    path = backup_root(dest) / "operations.jsonl"
+    out = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                    if isinstance(rec, dict):
+                        out.append(rec)
+                except ValueError:
+                    continue  # a line cut short by a crash
+    except OSError:
+        pass
+    return out
 
 
 # ---------------------------------------------------------------- discovery
@@ -531,6 +651,12 @@ class Repo:
         self.default = self._default_branch()
         self.has_head = git_ok(self.path, "rev-parse", "--verify", "-q", "HEAD") is not None
         self._unpushed_commits: set[str] | bool | None = None
+        self._features: dict | None = None
+
+    def features(self) -> dict:
+        if self._features is None:
+            self._features = repo_features(self)
+        return self._features
 
     def _default_branch(self) -> str | None:
         if self.remote:
@@ -695,6 +821,45 @@ class Repo:
         return trees
 
 
+def repo_features(repo: Repo) -> dict:
+    """Layouts that change what is safe: shallow and partial clones, sparse checkout, Git LFS, submodules."""
+    cfg = (git_ok(repo.path, "config", "--get-regexp",
+                  r"^(remote\..*\.promisor|extensions\.partialclone|core\.sparsecheckout)$") or "").lower()
+    try:
+        attrs = Path(repo.path, ".gitattributes").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        attrs = ""
+    return {
+        "shallow": (git_ok(repo.path, "rev-parse", "--is-shallow-repository") or "").strip() == "true",
+        "partial_clone": "promisor true" in cfg or "extensions.partialclone" in cfg,
+        "sparse": "core.sparsecheckout true" in cfg,
+        "lfs": "filter=lfs" in attrs or os.path.isdir(os.path.join(repo.git_dir, "lfs")),
+        "submodules": os.path.isfile(os.path.join(repo.path, ".gitmodules")),
+    }
+
+
+def remote_health(repo: Repo) -> list[dict]:
+    """Broken upstream tracking, remotes without URLs, local remotes whose folder is gone."""
+    notes = []
+    remotes = set((git_ok(repo.path, "remote") or "").split())
+    for line in (git_ok(repo.path, "config", "--get-regexp", r"^branch\..*\.remote$") or "").splitlines():
+        key, _, val = line.partition(" ")
+        branch = key[len("branch."):-len(".remote")]
+        if val and val != "." and val not in remotes:
+            notes.append({"level": "warn", "text": f"{branch} tracks remote '{val}', which does not exist"})
+    for r in sorted(remotes):
+        url = (git_ok(repo.path, "remote", "get-url", r) or "").strip()
+        if not url:
+            notes.append({"level": "warn", "text": f"Remote {r} has no URL"})
+            continue
+        local = url[7:] if url.startswith("file://") else url
+        if (os.path.isabs(local) or local.startswith(("./", "../"))) and not os.path.exists(os.path.join(repo.path, local)):
+            notes.append({"level": "warn", "text": f"Remote {r} points to a folder that no longer exists: {url}"})
+    if repo.remote and not repo.ref_exists(f"refs/remotes/{repo.remote}/HEAD"):
+        notes.append({"level": "info", "text": f"{repo.remote}/HEAD is not set; run git remote set-head {repo.remote} --auto"})
+    return notes
+
+
 def parse_status(text: str) -> dict:
     counts = {"staged": 0, "modified": 0, "untracked": 0, "conflicted": 0}
     files: list[dict] = []
@@ -801,6 +966,8 @@ def classify_branches(repo: Repo, trees: list[dict], only: str | None = None) ->
             status, reason = "review", "Fully on remote at last fetch, but fetch is stale; fetch first"
         elif LONG_LIVED.match(name):
             status, reason = "review", "Long-lived branch name (release, develop, staging...); confirm it is retired"
+        elif repo.features()["shallow"]:
+            status, reason = "review", "Shallow clone: history is incomplete, so this cannot be fully proven pushed"
         elif merged:
             status, reason = "safe", f"Merged into {repo.remote}/{repo.default}" + (" (upstream deleted)" if gone else "")
         else:
@@ -892,6 +1059,8 @@ def classify_worktrees(repo: Repo, trees: list[dict], measure: bool = True) -> l
                 base.update(status="safe", reason="Folder already gone; only stale metadata remains", action="prune")
         elif admin and any(os.path.exists(os.path.join(admin, m)) for m in BUSY_MARKERS):
             base.update(status="keep", reason="A git operation is in progress in this worktree")
+        elif admin and os.path.isdir(os.path.join(admin, "modules")):
+            base.update(status="keep", reason="Has initialized submodules; git cannot remove it without --force")
         else:
             base["bytes"] = dir_size(t["path"]) if measure else None
             d = dirty_state(t["path"])
@@ -1089,6 +1258,12 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
     cur = git_ok(repo.path, "symbolic-ref", "--quiet", "--short", "HEAD")
     result["branch"] = cur.strip() if cur else None
     result["detached"] = cur is None and repo.has_head
+    result["features"] = repo.features()
+    result["remote_health"] = [] if is_wt else remote_health(repo)
+    result["detached_orphans"] = 0
+    if result["detached"]:
+        out = git_ok(repo.path, "rev-list", "--count", "HEAD", "--not", "--branches", "--remotes", "--tags")
+        result["detached_orphans"] = int(out.strip()) if out and out.strip().isdigit() else 0
 
     # current branch vs its upstream
     up = git_ok(repo.path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}") if cur else None
@@ -1185,6 +1360,9 @@ def attention(r: dict) -> list[str]:
     notes = list(r.get("errors") or [])
     if r.get("fetch_error"):
         notes.append(f"Fetch failed: {r['fetch_error']}")
+    if r.get("detached_orphans"):
+        notes.append(f"Detached HEAD has {r['detached_orphans']} commit(s) on no branch; create a branch to keep them")
+    notes += [n["text"] for n in r.get("remote_health") or [] if n["level"] == "warn"]
     b = r.get("branch")
     if r["main_state"] == "worktree" or (b and b != r.get("default")):
         if b and r.get("upstream") and r["branch_ahead"] and r["branch_behind"]:
@@ -1403,10 +1581,11 @@ def cmd_backup(args) -> dict:
     except OSError as exc:
         return {"ok": False, "error": f"Cannot write to the backup folder {parent}: {exc.strerror or exc}"}
 
+    encrypt = bool(getattr(args, "encrypt", False))
     hashes: dict[str, str] = {}
     for rel in present:  # a locked, vanished or changing file must not abort the rest of the backup
         try:
-            hashes["files/" + rel] = copy_verified(os.path.join(repo.path, rel), dest / "files" / rel)
+            hashes["files/" + rel] = copy_verified(os.path.join(repo.path, rel), dest / "files" / rel, encrypt)
         except OSError as exc:
             problems.append({"part": "file", "path": rel, "error": exc.strerror or str(exc)})
 
@@ -1418,6 +1597,12 @@ def cmd_backup(args) -> dict:
         if ok is not True:
             problems.append({"part": "patch", "path": name, "error": "could not test that it restores" if ok is None
                              else f"does not apply cleanly to {base}"})
+        if encrypt:
+            try:
+                (dest / (name + ENC_SUFFIX)).write_bytes(encrypt_bytes(raw))
+                path.unlink()
+            except OSError as exc:
+                problems.append({"part": "patch", "path": name, "error": exc.strerror or str(exc)})
         return ok is True
 
     if repo.has_head:
@@ -1431,8 +1616,13 @@ def cmd_backup(args) -> dict:
     if stash_list is None:
         problems.append({"part": "stash", "error": "could not list stashes"})
     stash_n = len([l for l in (stash_list or "").splitlines() if l.strip()])
-    # the bundle can only carry refs/stash (the newest entry); every entry is also saved as a patch
+    # the bundle can only carry refs/stash (the newest entry); every entry is also saved as a patch,
+    # with its base commit and message so `restore` can rebuild it as a real stash entry
     stash_patches = []
+    stash_meta = []
+    for line in (git_ok(repo.path, "stash", "list", "--format=%H%x00%P%x00%gs") or "").splitlines():
+        sha, parents, msg = (line.split("\0") + ["", "", ""])[:3]
+        stash_meta.append({"sha": sha, "base": parents.split()[0] if parents else None, "message": msg})
     for n in range(stash_n):
         code, raw = git_bytes(repo.path, "stash", "show", "-p", "--binary", "--include-untracked", f"stash@{{{n}}}", timeout=120)
         if code != 0:  # git < 2.32 has no --include-untracked for stash show
@@ -1451,6 +1641,10 @@ def cmd_backup(args) -> dict:
     unp = repo.unpushed("--branches") if repo.remote else None
     if repo.remote and unp is None:
         problems.append({"part": "bundle", "error": "could not count unpushed commits"})
+    lfs = repo_features(repo).get("lfs")
+    if lfs and unp:
+        problems.append({"part": "bundle", "error": "Git LFS: the bundle carries commits but not LFS file contents; "
+                                                    "run git lfs push or keep the repository until they are pushed"})
     if repo.has_head and (unp or stash_n or not repo.remote):
         neg = ["--not", "--remotes"] if repo.remote else []
         path = dest / "unpushed.bundle"
@@ -1470,10 +1664,13 @@ def cmd_backup(args) -> dict:
         "complete": complete, "files": sorted(k[6:] for k in hashes if k.startswith("files/")),
         "sha256": hashes,  # keyed by path inside this backup folder
         "links": links, "failed": [p for p in problems if p["part"] == "file"], "problems": problems,
-        "deleted": deleted, "bytes": total, "bundle": bundle, "stash_patches": stash_patches,
+        "deleted": deleted, "bytes": total, "bundle": bundle, "stash_patches": stash_patches, "stashes": stash_meta,
+        "encrypted": "dpapi-user" if encrypt else None,
         "restore": [
+            "Everything: python repopulse.py restore --backup <this folder> (never overwrites without --overwrite).",
             "Files: copy files/ over the repository (or apply changes.patch with: git apply --binary changes.patch).",
-            "Commits: git fetch <path>/unpushed.bundle '+refs/heads/*:refs/remotes/backup/*' then inspect backup/<branch>.",
+            "Commits: git fetch <path>/unpushed.bundle '+refs/heads/*:refs/repopulse-backup/*' then inspect "
+            "refs/repopulse-backup/<branch> (not under refs/remotes, so it never makes local work look pushed).",
             "Stashes: git apply --binary stash-N.patch (stash-0 is the newest).",
             "Check: python repopulse.py verify --backup <path> re-hashes every file against this manifest.",
         ],
@@ -1504,7 +1701,7 @@ def cmd_verify(args) -> dict:
             bad.append({"path": rel, "error": "manifest entry points outside the backup"})
             continue
         try:
-            if file_sha256(path) != digest:
+            if hashlib.sha256(read_backup_file(path)).hexdigest() != digest:
                 bad.append({"path": rel, "error": "content changed"})
         except OSError as exc:
             bad.append({"path": rel, "error": exc.strerror or str(exc)})
@@ -1560,7 +1757,8 @@ def cmd_sync(args) -> dict:
     return {"ok": True, "steps": steps}
 
 
-def recycle(path: str) -> None:
+def recycle(path: str) -> str | None:
+    """Move to the Recycle Bin (Windows) or to `RepoPulse Backups/Trash` (elsewhere; returns where)."""
     if IS_WIN:
         import ctypes
         from ctypes import wintypes
@@ -1577,9 +1775,42 @@ def recycle(path: str) -> None:
             raise OSError(f"Recycle Bin refused (code {rc}); paths may be too long. Use permanent delete for rebuildable folders.")
         if os.path.exists(path):
             raise OSError("Recycle Bin did not remove the folder.")
-    else:
-        trash = unique_dir(backup_root(os.environ.get("REPOPULSE_TRASH")) / "Trash", f"{stamp()}-{path_tag(path)}")
-        shutil.move(path, str(trash / safe_name(os.path.basename(path))))
+        return None
+    trash = unique_dir(backup_root(os.environ.get("REPOPULSE_TRASH")) / "Trash", f"{stamp()}-{path_tag(path)}")
+    target = trash / safe_name(os.path.basename(path))
+    shutil.move(path, str(target))
+    return str(target)
+
+
+def unrecycle(path: str, trash: str | None) -> None:
+    """Put a recycled folder back where it was. Never overwrites: refuses when the path exists again."""
+    if os.path.lexists(path):
+        raise RuntimeError(f"{path} exists again; nothing was restored")
+    if trash:
+        if not os.path.exists(trash):
+            raise RuntimeError("It is no longer in the Repo Pulse trash folder")
+        shutil.move(trash, path)
+        return
+    if not IS_WIN:
+        raise RuntimeError("No trash location was recorded")
+    # Shell.Application lists the Recycle Bin with each item's original folder; move the newest match back.
+    script = (
+        "$ErrorActionPreference='Stop'; $sh = New-Object -ComObject Shell.Application; $bin = $sh.Namespace(10); "
+        "$t = $env:RP_TARGET; $parent = [System.IO.Path]::GetDirectoryName($t); $leaf = [System.IO.Path]::GetFileName($t); "
+        "$hit = @($bin.Items() | Where-Object { $_.Name -eq $leaf -and $bin.GetDetailsOf($_, 1) -eq $parent }) | "
+        "Sort-Object { $_.ModifyDate } -Descending | Select-Object -First 1; "
+        "if (-not $hit) { exit 3 }; Move-Item -LiteralPath $hit.Path -Destination $t"
+    )
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True,
+                           timeout=120, env=dict(os.environ, RP_TARGET=os.path.abspath(path)), creationflags=flags)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Could not reach the Recycle Bin: {exc}")
+    if r.returncode == 3:
+        raise RuntimeError("Not found in the Recycle Bin (emptied, or restored already)")
+    if r.returncode != 0 or not os.path.exists(path):
+        raise RuntimeError("The Recycle Bin did not restore it: " + r.stderr.decode("utf-8", "replace").strip()[-300:])
 
 
 def remove_permanently(path: str) -> None:
@@ -1706,17 +1937,24 @@ def cmd_clean(args) -> dict:
                 results.append({**row, "would": True, "bytes": it["bytes"], "reason": it["reason"],
                                 "recovery": recovery_hint(it, args.permanent)})
                 continue
+            op_id = new_op_id()
+            entry = {"op": "clean", "op_id": op_id, "repo": repo.path if repo else None, "kind": it["kind"],
+                     "target": it["target"], "head": it.get("head"), "branch": it.get("branch"), "status": it["status"],
+                     "action": it.get("action")}
+            log_operation(args.dest, {**entry, "phase": "started"})
+            undo = None
             try:
-                out = execute(repo, it, get_dest, args.permanent)
-                results.append({**row, "done": True, "bytes": out.get("bytes", it["bytes"]), "note": out["note"],
-                                "recovery": out.get("recovery"), "irreversible": out.get("irreversible", False)})
+                out = execute(repo, it, get_dest, args.permanent, encrypt=bool(getattr(args, "encrypt", False)))
+                undo = out.get("undo")
+                results.append({**row, "done": True, "op_id": op_id, "bytes": out.get("bytes", it["bytes"]),
+                                "note": out["note"], "recovery": out.get("recovery"),
+                                "irreversible": out.get("irreversible", False), "undoable": undo is not None})
             except Exception as exc:
-                results.append({**row, "reason": str(exc)})
+                results.append({**row, "op_id": op_id, "reason": str(exc)})
             last = results[-1]
-            log_operation(args.dest, {"op": "clean", "repo": repo.path if repo else None, "kind": it["kind"],
-                                      "target": it["target"], "head": it.get("head"), "status": it["status"],
-                                      "done": last["done"], "bytes": last.get("bytes"),
-                                      "note": last.get("note") or last.get("reason"), "recovery": last.get("recovery")})
+            log_operation(args.dest, {**entry, "phase": "finished", "done": last["done"], "bytes": last.get("bytes"),
+                                      "note": last.get("note") or last.get("reason"), "recovery": last.get("recovery"),
+                                      "irreversible": last.get("irreversible", False), "undo": undo})
     finally:
         if lock:
             try:
@@ -1745,7 +1983,8 @@ def recovery_hint(it: dict, permanent: bool) -> str:
     return ""
 
 
-def execute(repo: Repo | None, it: dict, get_dest, permanent: bool) -> dict:
+def execute(repo: Repo | None, it: dict, get_dest, permanent: bool, encrypt: bool = False) -> dict:
+    """Carry out one re-validated item. Returns note, recovery text, and `undo` data when it can be undone."""
     kind = it["kind"]
     if kind == "branch":
         name, head = it["target"], it["head"]
@@ -1765,7 +2004,8 @@ def execute(repo: Repo | None, it: dict, get_dest, permanent: bool) -> dict:
             raise RuntimeError(f"Branch changed since it was checked, kept (bundle saved anyway): {err}")
         git(repo.path, "config", "--remove-section", f"branch.{name}")  # upstream settings; absent is fine
         restore = f"git fetch \"{bundle}\" {name}:{name}"
-        return {"note": f"Saved to {bundle.name}; restore with: {restore}", "recovery": restore}
+        return {"note": f"Saved to {bundle.name}; restore with: {restore}", "recovery": restore,
+                "undo": {"type": "branch", "repo": repo.path, "name": name, "head": head, "bundle": str(bundle)}}
     if kind == "worktree":
         if it.get("action") == "prune":
             admin = worktree_admin_dir(repo, it["target"])
@@ -1782,21 +2022,27 @@ def execute(repo: Repo | None, it: dict, get_dest, permanent: bool) -> dict:
             sub = unique_dir(get_dest(), f"worktree-{safe_name(os.path.basename(it['target']))}-{path_tag(it['target'])}")
             hashes, links = {}, []
             for rel in it["precious"]:
-                h, problems = copy_tree_verified(it["target"], rel, sub / "ignored")
+                h, problems = copy_tree_verified(it["target"], rel, sub / "ignored", encrypt)
                 hashes.update(h)
                 errors = [p for p in problems if not p.get("link")]
                 links += [p["path"] for p in problems if p.get("link")]
                 if errors:
                     raise RuntimeError(f"Could not back up ignored file {errors[0]['path']} ({errors[0]['error']}); worktree kept")
-            write_json_atomic(sub / "manifest.json", {"worktree": it["target"], "branch": it.get("branch"), "head": it.get("head"),
-                                                      "sha256": hashes, "links_not_followed": links,
-                                                      "restore": "Copy ignored/ back into a new worktree of the same branch."})
+            write_json_atomic(sub / "manifest.json", {"format": 2, "kind": "worktree-ignored", "repo": repo.path,
+                                                      "worktree": it["target"], "branch": it.get("branch"), "head": it.get("head"),
+                                                      "sha256": {"ignored/" + k: v for k, v in hashes.items()},
+                                                      "links_not_followed": links, "complete": True,
+                                                      "encrypted": "dpapi-user" if encrypt else None,
+                                                      "restore": "python repopulse.py restore --backup <this folder> "
+                                                                 "copies ignored/ back into the worktree."})
             saved = sub
         code, _, err = git(repo.path, "worktree", "remove", it["target"], timeout=600)  # no --force: git refuses dirty trees
         if code != 0:
             raise RuntimeError(err)
         note = "Worktree removed (its branch is kept)" + (f"; ignored files saved to {saved}" if saved else "")
-        return {"note": note, "recovery": f"git worktree add \"{it['target']}\" {it.get('branch') or it.get('head')}"}
+        return {"note": note, "recovery": f"git worktree add \"{it['target']}\" {it.get('branch') or it.get('head')}",
+                "undo": {"type": "worktree", "repo": repo.path, "path": it["target"], "branch": it.get("branch"),
+                         "head": it.get("head"), "ignored_backup": str(saved) if saved else None}}
     if kind == "folder":
         full = os.path.join(repo.path, it["target"])
         if not within(full, repo.path) or os.path.islink(full) or is_junction(full):
@@ -1808,16 +2054,18 @@ def execute(repo: Repo | None, it: dict, get_dest, permanent: bool) -> dict:
                 raise RuntimeError("Permanent delete is only allowed for Safe rebuildable folders")
             remove_permanently(full)
             return {"note": "Deleted permanently (rebuildable)", "irreversible": True}
-        recycle(full)
-        return {"note": "Moved to Recycle Bin", "recovery": "Restore it from the Recycle Bin"}
+        where = recycle(full)
+        return {"note": "Moved to Recycle Bin", "recovery": "Restore it from the Recycle Bin",
+                "undo": {"type": "recycled", "path": os.path.abspath(full), "trash": where, "at": now()}}
     if kind == "cache":
         if os.path.islink(it["target"]) or is_junction(it["target"]):
             raise RuntimeError("Cache folder is a link; skipped")
         if permanent and it["status"] == "safe":
             remove_permanently(it["target"])
             return {"note": "Deleted permanently (re-downloadable)", "irreversible": True}
-        recycle(it["target"])
-        return {"note": "Moved to Recycle Bin", "recovery": "Restore it from the Recycle Bin"}
+        where = recycle(it["target"])
+        return {"note": "Moved to Recycle Bin", "recovery": "Restore it from the Recycle Bin",
+                "undo": {"type": "recycled", "path": os.path.abspath(it["target"]), "trash": where, "at": now()}}
     if kind == "gc":
         busy = repo.busy()
         if busy:
@@ -1830,6 +2078,436 @@ def execute(repo: Repo | None, it: dict, get_dest, permanent: bool) -> dict:
         freed = max(0, before - after)
         return {"note": f"git gc freed {human(freed)} (estimated up to {human(it['bytes'])})", "bytes": freed, "irreversible": True}
     raise RuntimeError(f"Unknown item kind {kind}")
+
+
+# ---------------------------------------------------------------- recovery
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if IS_WIN:  # os.kill(pid, 0) would terminate the process on Windows
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            return bool(k32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _commit_env(repo: Repo) -> dict:
+    """An identity for commit-tree when the user has none configured (restored stash entries only)."""
+    env = {}
+    if not (git_ok(repo.path, "config", "user.name") or "").strip():
+        env.update(GIT_AUTHOR_NAME="Repo Pulse", GIT_COMMITTER_NAME="Repo Pulse")
+    if not (git_ok(repo.path, "config", "user.email") or "").strip():
+        env.update(GIT_AUTHOR_EMAIL="repo-pulse@localhost", GIT_COMMITTER_EMAIL="repo-pulse@localhost")
+    return env
+
+
+def restore_bundle_branches(repo: Repo, bundle: Path, tag: str, only: list[str] | None = None, dry: bool = False) -> list[dict]:
+    """Recreate branches that are missing locally. An existing branch is never moved: when its tip differs,
+    the backed-up tip is kept at refs/repopulse-backup/<tag>/<name> to compare by hand."""
+    code, _, err = git(repo.path, "bundle", "verify", "--quiet", str(bundle), timeout=600)
+    if code:
+        raise RuntimeError(f"Bundle does not verify against this repository: {err}")
+    code, out, err = git(repo.path, "bundle", "list-heads", str(bundle))
+    if code:
+        raise RuntimeError(err)
+    results = []
+    for line in out.splitlines():
+        sha, _, ref = line.strip().partition(" ")
+        if not ref.startswith("refs/heads/"):
+            continue
+        name = ref[len("refs/heads/"):]
+        if only and name not in only:
+            continue
+        cur = (git_ok(repo.path, "rev-parse", "--verify", "-q", ref) or "").strip()
+        if cur == sha:
+            results.append({"branch": name, "done": True, "note": "already present"})
+            continue
+        if dry:
+            results.append({"branch": name, "would": True, "note": "would be recreated" if not cur else
+                            "exists with other commits; the backup tip would be kept beside it"})
+            continue
+        side = f"refs/repopulse-backup/{tag}/{name}"
+        code, _, err = git(repo.path, "fetch", "--no-tags", "--quiet", str(bundle), f"{ref}:{side}", timeout=600)
+        if code:
+            results.append({"branch": name, "done": False, "reason": err})
+            continue
+        if cur:
+            results.append({"branch": name, "done": False, "kept_at": side,
+                            "reason": f"{name} exists with other commits; the backup tip is at {side}"})
+            continue
+        code, _, err = git(repo.path, "update-ref", "-m", "repo-pulse: restore", ref, sha, "")  # "" = must not exist
+        git(repo.path, "update-ref", "-d", side)
+        results.append({"branch": name, "done": code == 0, "note": f"recreated at {sha[:10]}" if code == 0 else None,
+                        "reason": None if code == 0 else err})
+    return results
+
+
+def _stash_from_patch(repo: Repo, patch_bytes: bytes, base: str, message: str) -> str:
+    """Rebuild a stash entry (w commit with base and index parents) from a backed-up patch."""
+    fd, patch = tempfile.mkstemp(prefix="repopulse-stash-", suffix=".patch")
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(patch_bytes)
+    fd, idx = tempfile.mkstemp(prefix="repopulse-index-")
+    os.close(fd)
+    os.remove(idx)
+    env = {"GIT_INDEX_FILE": idx, **_commit_env(repo)}
+    try:
+        for args in (("read-tree", base), ("apply", "--cached", "--binary", patch)):
+            code, _, err = git(repo.path, *args, extra_env=env, timeout=120)
+            if code:
+                raise RuntimeError(f"could not rebuild the stash: {err}")
+        code, tree, err = git(repo.path, "write-tree", extra_env=env)
+        if code:
+            raise RuntimeError(err)
+        code, i_commit, err = git(repo.path, "commit-tree", f"{base}^{{tree}}", "-p", base, "-m", "index on " + message, extra_env=env)
+        if code:
+            raise RuntimeError(err)
+        code, w_commit, err = git(repo.path, "commit-tree", tree.strip(), "-p", base, "-p", i_commit.strip(), "-m", message, extra_env=env)
+        if code:
+            raise RuntimeError(err)
+        return w_commit.strip()
+    finally:
+        for p in (patch, idx, idx + ".lock"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def restore_stashes(repo: Repo, dest: Path, manifest: dict, tag: str, dry: bool) -> list[dict]:
+    existing = set((git_ok(repo.path, "log", "-g", "--format=%H", "refs/stash") or "").split())
+    metas = manifest.get("stashes") or []
+    patches = manifest.get("stash_patches") or []
+    bundle = dest / "unpushed.bundle"
+    if not dry and bundle.exists():  # brings the newest stash's exact objects back, if they were lost
+        git(repo.path, "fetch", "--no-tags", "--quiet", str(bundle), f"refs/stash:refs/repopulse-backup/{tag}/stash", timeout=600)
+    results = []
+    for n in reversed(range(len(patches))):  # oldest first, so stash@{0} ends up the newest again
+        meta = metas[n] if n < len(metas) else {}
+        sha, base = meta.get("sha"), meta.get("base")
+        msg = meta.get("message") or f"Restored by Repo Pulse from {patches[n]}"
+        if sha and sha in existing:
+            results.append({"stash": patches[n], "done": True, "note": "already in the stash list"})
+            continue
+        if dry:
+            results.append({"stash": patches[n], "would": True, "note": "would be added to the stash list"})
+            continue
+        try:
+            if not (sha and git_ok(repo.path, "cat-file", "-e", f"{sha}^{{commit}}") is not None):
+                if not base or git_ok(repo.path, "cat-file", "-e", f"{base}^{{commit}}") is None:
+                    raise RuntimeError("its base commit is not in this repository; apply the patch by hand")
+                sha = _stash_from_patch(repo, read_backup_file(dest / patches[n]), base, msg)
+            code, _, err = git(repo.path, "stash", "store", "-m", msg, sha)
+            if code:
+                raise RuntimeError(err)
+            results.append({"stash": patches[n], "done": True, "note": f"added to the stash list as {sha[:10]}"})
+        except (RuntimeError, OSError) as exc:
+            results.append({"stash": patches[n], "done": False, "reason": str(exc)})
+    git(repo.path, "update-ref", "-d", f"refs/repopulse-backup/{tag}/stash")
+    return results
+
+
+def restore_files(root: str, dest: Path, manifest: dict, prefix: str, overwrite: bool, dry: bool) -> list[dict]:
+    """Copy backed-up files back. A file with uncommitted changes that differ from the backup is kept
+    unless overwrite, and then the current version is saved to pre-restore-<time>/ in the backup first.
+    A file with no uncommitted changes is restored over: its current content is still in git."""
+    results, pre = [], None
+    status = dirty_state(root)
+    dirty = None if status.get("error") else {f["path"] for f in status["files"]}
+    hashes = manifest.get("sha256") or {}
+    keys = sorted(k for k in hashes if k.startswith(prefix + "/"))
+    if not hashes and prefix == "files":  # format 1 (0.4 and earlier): no hashes recorded
+        keys = [f"files/{f}" for f in manifest.get("files") or [] if isinstance(f, str)]
+    for key in keys:
+        rel = key[len(prefix) + 1:]
+        digest = hashes.get(key)
+        target = os.path.join(root, rel)
+        if not within(target, root):
+            results.append({"path": rel, "done": False, "reason": "points outside the target folder; skipped"})
+            continue
+        try:
+            data = read_backup_file(dest / key)
+            digest = digest or hashlib.sha256(data).hexdigest()
+            if hashlib.sha256(data).hexdigest() != digest:
+                results.append({"path": rel, "done": False, "reason": "the backup copy is damaged (hash mismatch)"})
+                continue
+            if os.path.lexists(longp(target)):
+                if os.path.isfile(longp(target)) and file_sha256(target) == digest:
+                    results.append({"path": rel, "done": True, "note": "unchanged"})
+                    continue
+                committed = dirty is not None and rel not in dirty and \
+                    git_ok(root, "ls-files", "--error-unmatch", "--", rel) is not None
+                if not overwrite and not committed:
+                    results.append({"path": rel, "done": False, "conflict": True,
+                                    "reason": "differs from the backup; your version was kept (use --overwrite)"})
+                    continue
+                if not dry:
+                    pre = pre or unique_dir(dest, f"pre-restore-{stamp()}")
+                    copy_verified(target, pre / rel)
+            if dry:
+                results.append({"path": rel, "would": True})
+                continue
+            os.makedirs(longp(os.path.dirname(target)), exist_ok=True)
+            tmp = target + ".repopulse-tmp"
+            with open(longp(tmp), "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(longp(tmp), longp(target))
+            results.append({"path": rel, "done": True, "note": "restored"})
+        except OSError as exc:
+            results.append({"path": rel, "done": False, "reason": exc.strerror or str(exc)})
+    if pre:
+        results.append({"path": str(pre), "done": True, "note": "your previous versions were saved here"})
+    return results
+
+
+def cmd_restore(args) -> dict:
+    tag = stamp()
+    if args.bundle:
+        if not args.repo:
+            return {"ok": False, "error": "--bundle needs --repo"}
+        repo = Repo(args.repo)
+        res = restore_bundle_branches(repo, Path(args.bundle), tag, dry=args.dry_run)
+        ok = all(r.get("done") or r.get("would") for r in res)
+        if not args.dry_run:
+            log_operation(args.dest, {"op": "restore", "op_id": new_op_id(), "repo": repo.path, "bundle": args.bundle, "ok": ok})
+        return {"ok": ok, "dry_run": args.dry_run, "branches": res}
+    dest = Path(args.backup)
+    try:
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": f"No readable manifest.json in {dest}: {exc}"}
+    out: dict = {"ok": True, "dry_run": args.dry_run, "backup": str(dest)}
+    if not manifest.get("complete", True) or (dest / "INCOMPLETE").exists():
+        out["warning"] = "This backup was recorded as incomplete; only what it holds can be restored."
+    if manifest.get("kind") == "worktree-ignored":
+        root = args.repo or manifest.get("worktree")
+        if not root or not os.path.isdir(root):
+            return {"ok": False, "error": f"Recreate the worktree first ({manifest.get('worktree')}), or pass --repo"}
+        out["files"] = restore_files(root, dest, manifest, "ignored", args.overwrite, args.dry_run)
+    else:
+        repo = Repo(args.repo or manifest["repo"])
+        parts = {p.strip() for p in (args.parts or "files,commits,stashes").split(",") if p.strip()}
+        if "files" in parts:
+            out["files"] = restore_files(repo.path, dest, manifest, "files", args.overwrite, args.dry_run)
+        if "commits" in parts and (dest / "unpushed.bundle").exists():
+            out["branches"] = restore_bundle_branches(repo, dest / "unpushed.bundle", tag, dry=args.dry_run)
+        if "stashes" in parts and manifest.get("stash_patches"):
+            out["stashes"] = restore_stashes(repo, dest, manifest, tag, args.dry_run)
+    rows = [r for k in ("files", "branches", "stashes") for r in out.get(k, [])]
+    out["ok"] = all(r.get("done") or r.get("would") for r in rows)
+    out["conflicts"] = len([r for r in rows if r.get("conflict")])
+    if not out["ok"]:
+        out["error"] = "; ".join(f"{r.get('path') or r.get('branch') or r.get('stash')}: {r['reason']}"
+                                 for r in rows if r.get("reason"))[:600]
+    if not args.dry_run:
+        log_operation(args.dest, {"op": "restore", "op_id": new_op_id(), "backup": str(dest), "ok": out["ok"],
+                                  "conflicts": out["conflicts"]})
+    return out
+
+
+def operations(dest: str | None) -> list[dict]:
+    """The journal folded into one row per operation, newest first."""
+    rows: dict[str, dict] = {}
+    undone = set()
+    for rec in read_operations(dest):
+        if rec.get("op") == "undo" and rec.get("done"):
+            undone.add(rec.get("undoes"))
+        oid = rec.get("op_id")
+        if not oid:
+            continue
+        row = rows.setdefault(oid, {})
+        row.update(rec)
+        if rec.get("phase") == "started":
+            row["started_at"] = rec.get("at")
+    out = []
+    for oid, row in rows.items():
+        if row.get("op") == "clean":
+            row["state"] = "interrupted" if row.get("phase") == "started" else \
+                ("recovered" if row.get("phase") == "recovered" else "done" if row.get("done") else "skipped")
+        row["undone"] = oid in undone
+        row["undoable"] = bool(row.get("undo")) and row.get("state") == "done" and oid not in undone
+        out.append(row)
+    return sorted(out, key=lambda r: r.get("at") or "", reverse=True)
+
+
+def cmd_ops(args) -> dict:
+    rows = operations(args.dest)
+    return {"ok": True, "operations": rows[:args.limit], "total": len(rows)}
+
+
+def cmd_undo(args) -> dict:
+    row = next((r for r in operations(args.dest) if r.get("op_id") == args.op), None)
+    if not row:
+        return {"ok": False, "error": f"No operation {args.op} in the journal"}
+    if row.get("undone"):
+        return {"ok": False, "error": "Already undone"}
+    if row.get("state") != "done":
+        return {"ok": False, "error": f"The operation is {row.get('state', 'not a cleanup')}; nothing to undo"}
+    u = row.get("undo")
+    if not u:
+        return {"ok": False, "irreversible": True,
+                "error": f"Cannot be undone: {row.get('note') or 'this action is irreversible'}"}
+    tag = stamp()
+    try:
+        if u["type"] == "branch":
+            res = restore_bundle_branches(Repo(u["repo"]), Path(u["bundle"]), tag, only=[u["name"]])
+            if not res or not res[0].get("done"):
+                raise RuntimeError(res[0].get("reason") if res else "branch not in the bundle")
+            note = f"Branch {u['name']} restored"
+        elif u["type"] == "worktree":
+            repo = Repo(u["repo"])
+            if os.path.lexists(u["path"]):
+                raise RuntimeError(f"{u['path']} exists again; nothing was restored")
+            checked_out = {t.get("branch") for t in repo.worktrees() or []}
+            if u.get("branch") and repo.ref_exists(f"refs/heads/{u['branch']}") and u["branch"] not in checked_out:
+                code, _, err = git(repo.path, "worktree", "add", u["path"], u["branch"], timeout=600)
+            else:
+                code, _, err = git(repo.path, "worktree", "add", "--detach", u["path"], u["head"], timeout=600)
+            if code:
+                raise RuntimeError(err)
+            note = "Worktree recreated"
+            if u.get("ignored_backup"):
+                bdir = Path(u["ignored_backup"])
+                manifest = json.loads((bdir / "manifest.json").read_text(encoding="utf-8"))
+                files = restore_files(u["path"], bdir, manifest, "ignored", False, False)
+                bad = [f for f in files if not f.get("done")]
+                note += f"; {len(files) - len(bad)} ignored file(s) put back" + (f", {len(bad)} failed" if bad else "")
+        elif u["type"] == "recycled":
+            unrecycle(u["path"], u.get("trash"))
+            note = "Restored from the Recycle Bin"
+        else:
+            raise RuntimeError(f"Unknown undo type {u['type']}")
+    except (RuntimeError, OSError, ValueError, KeyError) as exc:
+        log_operation(args.dest, {"op": "undo", "undoes": args.op, "done": False, "reason": str(exc)})
+        return {"ok": False, "error": str(exc)}
+    log_operation(args.dest, {"op": "undo", "undoes": args.op, "done": True, "note": note})
+    return {"ok": True, "note": note}
+
+
+def _interrupted_advice(row: dict, dest: str | None) -> str:
+    kind, target = row.get("kind"), row.get("target") or ""
+    if kind == "branch":
+        try:
+            repo = Repo(row["repo"])
+        except (RuntimeError, KeyError):
+            return "Repository is no longer readable"
+        if repo.ref_exists(f"refs/heads/{target}"):
+            return "Nothing was lost: the branch still exists"
+        bundles = sorted(repo_backup_dir(dest, repo).glob(f"cleanup-*/branch-{safe_name(target)}-*.bundle"),
+                         key=lambda p: p.stat().st_mtime)
+        return (f"The branch is gone; restore it with: python repopulse.py restore --repo \"{repo.path}\" --bundle \"{bundles[-1]}\""
+                if bundles else "The branch is gone and no bundle was found; check git reflog")
+    if kind == "worktree":
+        return "Nothing was removed: the folder still exists" if os.path.exists(target) else \
+            "The worktree was removed; its branch is kept. Ignored files, if any, are in the newest cleanup-* folder"
+    if kind in ("folder", "cache"):
+        full = os.path.join(row.get("repo") or "", target) if kind == "folder" else target
+        return "Nothing was moved: the folder still exists" if os.path.exists(full) else \
+            "The folder was moved; look for it in the Recycle Bin"
+    if kind == "gc":
+        return "git gc keeps the repository consistent even when interrupted; run git fsck to double-check"
+    return "Check the target by hand"
+
+
+def cmd_recover(args) -> dict:
+    """Find what a crash, power loss or forced termination left behind, and say how to recover it."""
+    rows = operations(args.dest)
+    interrupted = [{"op_id": r["op_id"], "kind": r.get("kind"), "target": r.get("target"), "repo": r.get("repo"),
+                    "started_at": r.get("started_at"), "advice": _interrupted_advice(r, args.dest)}
+                   for r in rows if r.get("state") == "interrupted"]
+    root = backup_root(args.dest)
+    incomplete = sorted(str(p.parent) for p in root.glob("*/*/INCOMPLETE")) if root.is_dir() else []
+    locks = []
+    for repo_path in sorted({r["repo"] for r in rows if r.get("repo")}):
+        try:
+            lock = Path(Repo(repo_path).git_dir) / "repopulse.lock"
+            if not lock.exists():
+                continue
+            pid = int(json.loads(lock.read_text(encoding="utf-8")).get("pid", 0))
+        except (RuntimeError, OSError, ValueError, AttributeError):
+            continue
+        stale = not pid_alive(pid)
+        if stale and args.fix:
+            lock.unlink(missing_ok=True)
+        locks.append({"repo": repo_path, "pid": pid, "stale": stale, "removed": stale and args.fix})
+    if args.fix:
+        for r in interrupted:
+            log_operation(args.dest, {"op": "clean", "op_id": r["op_id"], "phase": "recovered", "advice": r["advice"]})
+    return {"ok": True, "interrupted": interrupted, "incomplete_backups": incomplete, "locks": locks,
+            "clean": not interrupted and not incomplete and not any(l["stale"] for l in locks)}
+
+
+def cmd_backups(args) -> dict:
+    """Backup management: every backup and cleanup folder, with integrity, size and how to restore it."""
+    root = backup_root(args.dest)
+    entries = []
+    if root.is_dir():
+        for repo_dir in sorted(p for p in root.iterdir() if p.is_dir() and p.name not in ("Trash",)):
+            for d in sorted(p for p in repo_dir.iterdir() if p.is_dir()):
+                manifest_path = d / "manifest.json"
+                if manifest_path.exists():
+                    try:
+                        m = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        m = {}
+                    e = {"kind": "backup", "path": str(d), "repo": m.get("repo"), "created": m.get("created"),
+                         "complete": bool(m.get("complete", True)) and not (d / "INCOMPLETE").exists(),
+                         "encrypted": bool(m.get("encrypted")), "files": len(m.get("files") or []),
+                         "has_bundle": (d / "unpushed.bundle").exists(), "stashes": len(m.get("stash_patches") or []),
+                         "restore": f"python repopulse.py restore --backup \"{d}\""}
+                elif d.name.startswith("cleanup-"):
+                    e = {"kind": "cleanup", "path": str(d), "created": d.name[len("cleanup-"):],
+                         "bundles": [p.name for p in sorted(d.glob("branch-*.bundle"))],
+                         "worktrees": [p.name for p in sorted(d.glob("worktree-*"))], "complete": True}
+                else:
+                    continue
+                e["bytes"] = dir_size(d)
+                e["age_days"] = round((now() - d.stat().st_mtime) / 86400, 1)
+                if args.verify and e["kind"] == "backup":
+                    v = cmd_verify(argparse.Namespace(backup=str(d)))
+                    e["verified"] = v["ok"]
+                    e["verify_error"] = v.get("error")
+                entries.append(e)
+    prune = []
+    if args.prune_days is not None:  # retention: complete backups older than N days, keeping the newest per repo
+        newest: dict[str, str] = {}
+        for e in entries:
+            if e["kind"] == "backup" and e["complete"]:
+                key = os.path.dirname(e["path"])
+                newest[key] = max(newest.get(key, ""), e["path"])
+        for e in entries:
+            if e["age_days"] >= args.prune_days and e["complete"] and newest.get(os.path.dirname(e["path"])) != e["path"]:
+                if e.get("verified") is False:
+                    continue
+                prune.append(e["path"])
+        if args.apply:
+            for p in prune:
+                try:
+                    recycle(p)
+                    log_operation(args.dest, {"op": "prune-backup", "op_id": new_op_id(), "path": p, "done": True})
+                except OSError as exc:
+                    log_operation(args.dest, {"op": "prune-backup", "op_id": new_op_id(), "path": p, "done": False, "reason": str(exc)})
+    free = free_bytes(root)
+    return {"ok": True, "root": str(root), "backups": entries, "free_bytes": free,
+            "totals": {"count": len(entries), "bytes": sum(e["bytes"] for e in entries),
+                       "incomplete": len([e for e in entries if not e["complete"]])},
+            "prune": {"days": args.prune_days, "candidates": prune, "applied": bool(args.apply)} if args.prune_days is not None else None}
 
 
 def cmd_diff(args) -> dict:
@@ -1893,6 +2571,29 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--repo", required=True)
     b.add_argument("--dest")
     b.add_argument("--max-gb", type=float, default=2.0)
+    b.add_argument("--encrypt", action="store_true", help="Encrypt copied files and patches for this Windows account (DPAPI)")
+    rs = sub.add_parser("restore", help="Restore files, branches and stashes from a backup, or branches from a bundle")
+    rs.add_argument("--backup", help="A backup folder (or a worktree-* folder from a cleanup)")
+    rs.add_argument("--bundle", help="A branch bundle from a cleanup folder")
+    rs.add_argument("--repo", help="Target repository (default: the one recorded in the backup)")
+    rs.add_argument("--parts", help="Comma-separated: files,commits,stashes (default: all)")
+    rs.add_argument("--overwrite", action="store_true", help="Replace changed files (your versions are saved first)")
+    rs.add_argument("--dry-run", action="store_true")
+    rs.add_argument("--dest", help="Backup root, for the operation journal")
+    u = sub.add_parser("undo", help="Undo one cleanup operation from the journal")
+    u.add_argument("--op", required=True, help="Operation id, as listed by `ops`")
+    u.add_argument("--dest")
+    o = sub.add_parser("ops", help="Operation history: what was done, outcome, recovery")
+    o.add_argument("--dest")
+    o.add_argument("--limit", type=int, default=100)
+    rc = sub.add_parser("recover", help="Find operations cut short by a crash and say how to recover")
+    rc.add_argument("--dest")
+    rc.add_argument("--fix", action="store_true", help="Remove stale locks and mark interrupted operations as reviewed")
+    bk = sub.add_parser("backups", help="List backups with integrity, size and restore commands")
+    bk.add_argument("--dest")
+    bk.add_argument("--verify", action="store_true", help="Re-hash every backup")
+    bk.add_argument("--prune-days", type=float, help="Retention: list complete backups older than N days (newest per repo kept)")
+    bk.add_argument("--apply", action="store_true", help="With --prune-days: move them to the Recycle Bin")
     y = sub.add_parser("sync", help="Fast-forward default branch; optional non-force push")
     y.add_argument("--repo", required=True)
     y.add_argument("--push", action="store_true")
@@ -1903,6 +2604,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--allow-review", action="store_true", help="Approve every listed id even if it is Review")
     c.add_argument("--permanent", action="store_true", help="Delete Safe rebuildable folders instead of recycling")
     c.add_argument("--dry-run", action="store_true", help="Re-check and report what would happen; change nothing")
+    c.add_argument("--encrypt", action="store_true", help="Encrypt the ignored files saved from removed worktrees (DPAPI)")
     c.add_argument("--dest")
     v = sub.add_parser("verify", help="Re-check a backup against its manifest")
     v.add_argument("--backup", required=True)
@@ -1912,10 +2614,18 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+MIN_PYTHON = (3, 11)
+
+
 def main(argv: list[str] | None = None) -> int:
+    if sys.version_info < MIN_PYTHON:
+        sys.stdout.write(json.dumps({"ok": False, "error": f"Repo Pulse needs Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer "
+                                                           f"(this is {sys.version.split()[0]})."}) + "\n")
+        return 1
     args = build_parser().parse_args(argv)
     handlers = {"scan": cmd_scan, "backup": cmd_backup, "sync": cmd_sync, "clean": cmd_clean, "diff": cmd_diff,
-                "verify": cmd_verify}
+                "verify": cmd_verify, "restore": cmd_restore, "undo": cmd_undo, "ops": cmd_ops,
+                "recover": cmd_recover, "backups": cmd_backups}
     try:
         result = handlers[args.cmd](args)
     except Exception as exc:

@@ -10,7 +10,7 @@ foreach ($c in @('py', 'python')) {
     $cmd = Get-Command $c -ErrorAction SilentlyContinue
     if ($cmd -and $cmd.Source -notlike '*\WindowsApps\*') { $python = $c; break }
 }
-if (-not $python) { throw 'Install Python 3.10+ from python.org (include the Python launcher), then run Build again.' }
+if (-not $python) { throw 'Install Python 3.11+ from python.org (include the Python launcher), then run Build again.' }
 
 $out = Join-Path $root 'build\release'
 dotnet build (Join-Path $root 'source\RepoPulse.csproj') -c Release -o $out --nologo

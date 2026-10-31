@@ -31,6 +31,23 @@ Safety, backup and recovery reliability.
 - New untracked folders list each file, so counts, diffs and backups see real files.
 - Every existing global cache location is found, not only the first.
 - New `clean --dry-run` reports what would be removed, the space and how to recover it, without changing anything.
+- Git for Windows silently skipped paths over 260 characters, so a backup could miss them and still report success. Every git call now enables `core.longpaths` on Windows.
+
+### Recovery
+- **`restore`** puts a backup back: files (a file with uncommitted changes that differ from the backup is never overwritten without `--overwrite`, and then your version is saved first), branches (missing ones are recreated; an existing branch is never moved, the backed-up tip is kept at `refs/repopulse-backup/…`), and every stash, rebuilt as real stash entries even in a fresh clone. `restore --bundle` brings back a branch removed by cleanup; `restore --backup <worktree-…>` puts saved ignored files back.
+- **`undo --op ID`** reverses a cleanup: deleted branches, removed worktrees (with their ignored files) and folders moved to the Recycle Bin. Irreversible actions (`git gc`, pruned metadata, permanent deletes) are marked as such and refused.
+- **Operation journal.** Every cleanup writes a `started` line before it changes anything and a `finished` line after, with the previous ref, outcome, freed space and recovery data. `ops` lists them; **`recover`** finds operations cut short by a crash or power loss, says what to check, and with `--fix` removes stale locks left by dead processes.
+- **`backups`** lists every backup and cleanup folder with completeness, encryption, size, age and restore command; `--verify` re-hashes them; `--prune-days N [--apply]` is a retention policy that keeps the newest per repository and moves the rest to the Recycle Bin.
+- **Encrypted backups** (`backup --encrypt`, `clean --encrypt`): copied files, patches and saved ignored files are encrypted with Windows DPAPI for the current Windows account, and each one is decrypted again to prove it.
+- Backup manifests now record each stash's base commit and message. The old restore hint (fetching into `refs/remotes/backup/*`) is replaced: refs under `refs/remotes` would make unpushed work look pushed.
+
+### Repository layouts
+- Shallow clones, partial clones, sparse checkout, Git LFS and submodules are detected (`features`). Branches of a shallow clone are never Safe; worktrees with initialized submodules are kept; a backup of an LFS repository with unpushed commits says the LFS contents are not in the bundle.
+- **Remote health**: branches tracking a remote that does not exist, remotes without a URL, local remotes whose folder is gone, and an unset `origin/HEAD` are reported.
+- A detached HEAD with commits on no branch is flagged so they are not lost.
+
+### Runtime
+- Python 3.11 or newer is required (3.10 reached end of life in October 2026).
 
 ## 0.4.0 — 2026-10-11
 

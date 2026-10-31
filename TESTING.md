@@ -6,7 +6,7 @@
 py -3 -m unittest discover -s tests -v
 ```
 
-CI (`.github/workflows/ci.yml`) runs these on Windows, Linux and macOS with Python 3.10 and 3.13 and
+CI (`.github/workflows/ci.yml`) runs these on Windows, Linux and macOS with Python 3.11 and 3.14 and
 builds the widget on Windows. Pushing a `v*` tag runs `.github/workflows/release.yml`, which tests
 again, checks the tag matches both version numbers and publishes the downloads.
 

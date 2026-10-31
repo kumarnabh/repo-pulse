@@ -31,7 +31,23 @@ repopulse.py backup  --repo PATH [--dest DIR]
 repopulse.py sync    --repo PATH [--push]
 repopulse.py clean   --repo PATH --ids ID1,ID2 [--review-ids ID2] [--allow-review] [--dry-run] [--permanent] [--dest DIR]
 repopulse.py verify  --backup DIR
+repopulse.py restore --backup DIR [--repo PATH] [--parts files,commits,stashes] [--overwrite] [--dry-run]
+repopulse.py restore --bundle FILE --repo PATH
+repopulse.py undo    --op OP_ID
+repopulse.py ops     [--limit N]
+repopulse.py recover [--fix]
+repopulse.py backups [--verify] [--prune-days N [--apply]]
 ```
+
+`restore` never moves an existing branch and never overwrites a file with uncommitted changes unless
+`--overwrite` is given (the current version is first saved to `pre-restore-<time>/` in the backup).
+Restored branch tips that clash with an existing branch are kept at `refs/repopulse-backup/<time>/<name>`,
+outside `refs/remotes`, so they never make local work look pushed. Stashes are rebuilt as real stash
+entries from their patch and recorded base commit when the original objects are gone.
+`undo` reverses one journaled cleanup (branch, worktree with its ignored files, recycled folder); `git gc`,
+pruned metadata and permanent deletes are irreversible and say so. `recover` lists cleanups that wrote a
+`started` journal line but no `finished` line (crash, power loss, forced termination) with advice, plus
+incomplete backups and stale locks.
 
 `clean --review-ids` names the Review items the user approved one by one; every other id must still
 be Safe when it is re-checked. `--allow-review` approves every listed id (command-line use only).

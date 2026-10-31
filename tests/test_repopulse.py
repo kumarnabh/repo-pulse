@@ -638,10 +638,10 @@ class TestReleaseSafety(Fixture):
         Path(self.repo, "locked.txt").write_text("in use")
         real = rp.copy_verified
 
-        def flaky(src, dst):
+        def flaky(src, dst, encrypt=False):
             if src.endswith("locked.txt"):
                 raise PermissionError(13, "The process cannot access the file")
-            return real(src, dst)
+            return real(src, dst, encrypt)
         rp.copy_verified = flaky
         try:
             res = backup("--repo", str(self.repo), "--dest", str(self.dest))
@@ -873,6 +873,356 @@ class TestEngineAccuracy(Fixture):
         s = self.scan()
         self.assertEqual(s["dirty"]["untracked"], 2)
         self.assertEqual(sorted(f["path"] for f in s["dirty"]["files"]), ["new/2.txt", "new/a/1.txt"])
+
+
+def run(cmd, *argv):
+    return getattr(rp, f"cmd_{cmd}")(rp.build_parser().parse_args([cmd, *argv]))
+
+
+class TestRecoveryDrills(Fixture):
+    """Prove that what a backup or cleanup saved can really be put back (acceptance: every backup restorable)."""
+
+    def make_work(self):
+        Path(self.repo, "README.md").write_text("stash one")
+        g(self.repo, "stash", "push", "-q", "-m", "first")
+        Path(self.repo, "README.md").write_text("stash two")
+        g(self.repo, "stash", "push", "-q", "-m", "second")
+        g(self.repo, "switch", "-qc", "wip")
+        commit(self.repo, "wip.txt", "unpushed work")
+        g(self.repo, "switch", "-q", "main")
+        Path(self.repo, "README.md").write_text("dirty edit")
+        Path(self.repo, "staged.txt").write_text("staged")
+        g(self.repo, "add", "staged.txt")
+        Path(self.repo, "ünïcode dir").mkdir()
+        Path(self.repo, "ünïcode dir", "naïve file.txt").write_text("unicode ✓", encoding="utf-8")
+
+    def test_full_restore_into_the_same_repo(self):
+        self.make_work()
+        wip = g(self.repo, "rev-parse", "wip")
+        stashes = g(self.repo, "log", "-g", "--format=%H", "refs/stash").split()
+        res = backup("--repo", str(self.repo), "--dest", str(self.dest))
+        self.assertTrue(res["ok"], res)
+        # lose everything
+        g(self.repo, "reset", "-q", "--hard")
+        g(self.repo, "clean", "-qfd")
+        g(self.repo, "branch", "-qD", "wip")
+        g(self.repo, "stash", "clear")
+        out = run("restore", "--backup", res["backup"], "--dest", str(self.dest))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(Path(self.repo, "README.md").read_text(), "dirty edit")
+        self.assertEqual(Path(self.repo, "ünïcode dir", "naïve file.txt").read_text(encoding="utf-8"), "unicode ✓")
+        self.assertEqual(g(self.repo, "rev-parse", "wip"), wip)
+        self.assertEqual(g(self.repo, "log", "-g", "--format=%H", "refs/stash").split(), stashes)
+
+    def test_stashes_rebuild_in_a_fresh_clone(self):
+        self.make_work()
+        res = backup("--repo", str(self.repo), "--dest", str(self.dest))
+        self.assertTrue(res["ok"], res)
+        fresh = self.other_clone()
+        out = run("restore", "--backup", res["backup"], "--repo", str(fresh), "--parts", "commits,stashes",
+                  "--dest", str(self.dest))
+        self.assertTrue(out["ok"], out)
+        self.assertIn("+stash two", g(fresh, "stash", "show", "-p", "stash@{0}"))
+        self.assertIn("+stash one", g(fresh, "stash", "show", "-p", "stash@{1}"))
+        g(fresh, "stash", "apply", "-q", "stash@{1}")
+        self.assertEqual(Path(fresh, "README.md").read_text(), "stash one")
+        self.assertEqual(g(fresh, "log", "-1", "--format=%s", "wip"), "add wip.txt")
+
+    def test_restore_never_overwrites_without_consent(self):
+        Path(self.repo, "README.md").write_text("backed up")
+        res = backup("--repo", str(self.repo), "--dest", str(self.dest))
+        Path(self.repo, "README.md").write_text("newer work")
+        out = run("restore", "--backup", res["backup"], "--parts", "files")
+        self.assertEqual(out["conflicts"], 1)
+        self.assertEqual(Path(self.repo, "README.md").read_text(), "newer work")
+        out = run("restore", "--backup", res["backup"], "--parts", "files", "--overwrite")
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(Path(self.repo, "README.md").read_text(), "backed up")
+        pre = next(Path(res["backup"]).glob("pre-restore-*"))
+        self.assertEqual((pre / "README.md").read_text(), "newer work")
+
+    def test_existing_branch_is_never_moved(self):
+        g(self.repo, "switch", "-qc", "topic")
+        commit(self.repo, "t.txt", "v1")
+        g(self.repo, "switch", "-q", "main")
+        res = backup("--repo", str(self.repo), "--dest", str(self.dest))
+        g(self.repo, "switch", "-q", "topic")
+        commit(self.repo, "t2.txt", "v2")
+        g(self.repo, "switch", "-q", "main")
+        tip = g(self.repo, "rev-parse", "topic")
+        out = run("restore", "--backup", res["backup"], "--parts", "commits")
+        self.assertFalse(out["ok"])
+        self.assertEqual(g(self.repo, "rev-parse", "topic"), tip)
+        self.assertTrue(out["branches"][0]["kept_at"].startswith("refs/repopulse-backup/"))
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI is Windows-only")
+    def test_encrypted_backup_restores(self):
+        Path(self.repo, ".env.local").write_text("SECRET=1")
+        Path(self.repo, "README.md").write_text("secret edit")
+        res = backup("--repo", str(self.repo), "--dest", str(self.dest), "--encrypt")
+        self.assertTrue(res["ok"], res)
+        b = Path(res["backup"])
+        self.assertFalse((b / "files" / ".env.local").exists())
+        self.assertNotIn(b"SECRET", (b / "files" / ".env.local.dpapi").read_bytes())
+        self.assertFalse((b / "changes.patch").exists())
+        self.assertTrue(run("verify", "--backup", str(b))["ok"])
+        os.remove(self.repo / ".env.local")
+        out = run("restore", "--backup", str(b), "--parts", "files", "--overwrite")
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(Path(self.repo, ".env.local").read_text(), "SECRET=1")
+
+
+class TestUndoAndJournal(Fixture):
+    def pushed(self, name):
+        g(self.repo, "switch", "-qc", name, "main")
+        commit(self.repo, f"{name}.txt")
+        g(self.repo, "push", "-q", "-u", "origin", name)
+        g(self.repo, "switch", "-q", "main")
+        return g(self.repo, "rev-parse", name)
+
+    def clean_ids(self, *ids, review=False):
+        argv = ["--repo", str(self.repo), "--ids", ",".join(ids), "--dest", str(self.dest)]
+        return clean(*argv, *(["--review-ids", ",".join(ids)] if review else []))
+
+    def test_undo_branch_delete(self):
+        tip = self.pushed("gone")
+        self.fetch()
+        res = self.clean_ids(by_target(self.scan(), "branch", "gone")["id"])
+        r = res["results"][0]
+        self.assertTrue(r["done"] and r["undoable"], r)
+        out = run("undo", "--op", r["op_id"], "--dest", str(self.dest))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(g(self.repo, "rev-parse", "gone"), tip)
+        self.assertFalse(run("undo", "--op", r["op_id"], "--dest", str(self.dest))["ok"])  # only once
+        ops = run("ops", "--dest", str(self.dest))["operations"]
+        self.assertTrue(next(o for o in ops if o.get("op_id") == r["op_id"])["undone"])
+
+    def test_undo_worktree_removal_puts_ignored_files_back(self):
+        Path(self.repo, ".gitignore").write_text(".env\n")
+        g(self.repo, "add", ".gitignore")
+        g(self.repo, "commit", "-qm", "ignore")
+        g(self.repo, "push", "-q")
+        wt = self.tmp / "wts" / "agent"
+        g(self.repo, "worktree", "add", "-q", str(wt), "-b", "agent")
+        g(wt, "push", "-q", "-u", "origin", "agent")
+        (wt / ".env").write_text("KEY=1")
+        self.fetch()
+        it = by_target(self.scan(), "worktree", str(wt))
+        r = self.clean_ids(it["id"], review=True)["results"][0]
+        self.assertTrue(r["done"], r)
+        self.assertFalse(wt.exists())
+        out = run("undo", "--op", r["op_id"], "--dest", str(self.dest))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual((wt / ".env").read_text(), "KEY=1")
+        self.assertEqual(g(wt, "branch", "--show-current"), "agent")
+
+    def test_undo_recycled_folder(self):
+        Path(self.repo, ".gitignore").write_text("node_modules/\n")
+        Path(self.repo, "package.json").write_text("{}")
+        g(self.repo, "add", ".")
+        g(self.repo, "commit", "-qm", "node")
+        (self.repo / "node_modules").mkdir()
+        (self.repo / "node_modules" / f"marker-{os.getpid()}.js").write_text("x")
+        r = self.clean_ids(by_target(self.scan(), "folder", "node_modules")["id"])["results"][0]
+        self.assertTrue(r["done"], r)
+        out = run("undo", "--op", r["op_id"], "--dest", str(self.dest))
+        self.assertTrue(out["ok"], out)
+        self.assertTrue((self.repo / "node_modules" / f"marker-{os.getpid()}.js").exists())
+
+    def test_irreversible_actions_say_so(self):
+        wt = self.tmp / "wts" / "stale"
+        g(self.repo, "worktree", "add", "-q", str(wt), "-b", "stale")
+        shutil.rmtree(wt)
+        r = self.clean_ids(by_target(self.scan(), "worktree", str(wt))["id"])["results"][0]
+        self.assertTrue(r["done"] and r["irreversible"] and not r["undoable"], r)
+        out = run("undo", "--op", r["op_id"], "--dest", str(self.dest))
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["irreversible"])
+
+    def test_crash_mid_cleanup_is_found_by_recover(self):
+        self.pushed("victim")
+        self.fetch()
+        it = by_target(self.scan(), "branch", "victim")
+        real = rp.execute
+
+        def crash(*a, **k):
+            raise KeyboardInterrupt  # stands in for power loss or a killed process: not caught as an error
+        rp.execute = crash
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.clean_ids(it["id"])
+        finally:
+            rp.execute = real
+        rec = run("recover", "--dest", str(self.dest))
+        self.assertEqual(len(rec["interrupted"]), 1)
+        self.assertIn("still exists", rec["interrupted"][0]["advice"])
+        # a lock left by a dead process is reported and removed with --fix
+        lock = Path(rp.Repo(str(self.repo)).git_dir) / "repopulse.lock"
+        lock.write_text(json.dumps({"pid": 4_000_000, "at": time.time()}))
+        rec = run("recover", "--dest", str(self.dest), "--fix")
+        self.assertTrue(rec["locks"][0]["stale"])
+        self.assertFalse(lock.exists())
+        self.assertEqual(run("recover", "--dest", str(self.dest))["interrupted"], [])
+
+    def test_backup_center_lists_and_prunes(self):
+        for text in ("one", "two", "three"):
+            Path(self.repo, "README.md").write_text(text)
+            self.assertTrue(backup("--repo", str(self.repo), "--dest", str(self.dest))["ok"])
+        listing = run("backups", "--dest", str(self.dest), "--verify")
+        self.assertEqual(listing["totals"]["count"], 3)
+        self.assertTrue(all(e["verified"] for e in listing["backups"]))
+        prune = run("backups", "--dest", str(self.dest), "--prune-days", "0")["prune"]
+        self.assertEqual(len(prune["candidates"]), 2)  # the newest is always kept
+        self.assertFalse(prune["applied"])
+
+
+class TestFaultsAndAdversarialFiles(Fixture):
+    def test_disk_full_during_copy(self):
+        import errno
+        Path(self.repo, "README.md").write_text("changed")
+        real = rp.copy_verified
+
+        def full(src, dst, encrypt=False):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        rp.copy_verified = full
+        try:
+            res = backup("--repo", str(self.repo), "--dest", str(self.dest))
+        finally:
+            rp.copy_verified = real
+        self.assertFalse(res["ok"])
+        self.assertIn("No space left", res["error"])
+
+    def test_not_enough_free_space_refuses_before_writing(self):
+        Path(self.repo, "README.md").write_text("changed")
+        real = rp.free_bytes
+        rp.free_bytes = lambda p: 1024
+        try:
+            res = backup("--repo", str(self.repo), "--dest", str(self.dest))
+        finally:
+            rp.free_bytes = real
+        self.assertFalse(res["ok"])
+        self.assertIn("Not enough free space", res["error"])
+        self.assertFalse(self.dest.exists())
+
+    def test_recycle_refusal_keeps_folder_and_reports(self):
+        Path(self.repo, ".gitignore").write_text("node_modules/\n")
+        Path(self.repo, "package.json").write_text("{}")
+        g(self.repo, "add", ".")
+        g(self.repo, "commit", "-qm", "node")
+        (self.repo / "node_modules").mkdir()
+        (self.repo / "node_modules" / "a.js").write_text("x")
+        real = rp.recycle
+
+        def refuse(path):
+            raise OSError("Recycle Bin refused (code 120)")
+        rp.recycle = refuse
+        try:
+            r = clean("--repo", str(self.repo), "--ids", by_target(self.scan(), "folder", "node_modules")["id"],
+                      "--dest", str(self.dest))["results"][0]
+        finally:
+            rp.recycle = real
+        self.assertFalse(r["done"])
+        self.assertIn("Recycle Bin refused", r["reason"])
+        self.assertTrue((self.repo / "node_modules" / "a.js").exists())
+
+    def test_interrupted_copy_leaves_no_partial_file(self):
+        src = self.tmp / "big.bin"
+        src.write_bytes(b"1" * 3_000_000)
+        dst = self.tmp / "out" / "big.bin"
+        real = rp.file_sha256
+        rp.file_sha256 = lambda p: "0" * 64  # the verify step sees a different hash
+        try:
+            with self.assertRaises(OSError):
+                rp.copy_verified(str(src), dst)
+        finally:
+            rp.file_sha256 = real
+        self.assertFalse(dst.exists())
+
+    @unittest.skipUnless(os.name == "nt", "long-path handling is Windows-specific")
+    def test_long_paths_are_backed_up(self):
+        deep = self.repo
+        for i in range(6):
+            deep = deep / ("d" * 45 + str(i))
+        os.makedirs(rp.longp(deep))
+        with open(rp.longp(deep / "long-file-name.txt"), "w") as fh:
+            fh.write("deep")
+        self.assertGreater(len(str(deep / "long-file-name.txt")), 260)
+        res = backup("--repo", str(self.repo), "--dest", str(self.dest))
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["files"], 1)
+
+    def test_link_named_like_junk_is_never_offered(self):
+        outside = self.tmp / "precious"
+        outside.mkdir()
+        (outside / "data.txt").write_text("keep")
+        Path(self.repo, ".gitignore").write_text("node_modules\n")
+        Path(self.repo, "package.json").write_text("{}")
+        link = self.repo / "node_modules"
+        try:
+            if os.name == "nt":
+                subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(outside)], check=True, capture_output=True)
+            else:
+                os.symlink(outside, link, target_is_directory=True)
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("cannot create links here")
+        s = self.scan()
+        self.assertFalse([i for i in s["items"] if i["kind"] == "folder" and i["target"] == "node_modules"])
+        self.assertIsNone(rp.classify_folder(str(self.repo), "node_modules"))
+        self.assertTrue((outside / "data.txt").exists())
+
+    def test_malformed_git_metadata_does_not_break_scanning(self):
+        bad = self.tmp / "code" / "badwt"
+        bad.mkdir()
+        (bad / ".git").write_text("gitdir: /nowhere/.git/worktrees/x")
+        data = rp.cmd_scan(rp.build_parser().parse_args(["scan", "--roots", str(self.tmp / "code"), "--no-hints"]))
+        self.assertTrue(data["ok"])
+        row = next(r for r in data["repos"] if r["name"] == "badwt")
+        self.assertIn("error", row)
+
+    @unittest.skipIf(os.name == "nt", "chmod does not block reads on Windows")
+    def test_unreadable_folder_is_reported_not_fatal(self):
+        locked = self.repo / "locked"
+        locked.mkdir()
+        (locked / "f.txt").write_text("x")
+        os.chmod(locked, 0)
+        try:
+            res = backup("--repo", str(self.repo), "--dest", str(self.dest))
+        finally:
+            os.chmod(locked, 0o755)
+        self.assertIn("ok", res)
+
+
+class TestAdvancedRepos(Fixture):
+    def test_shallow_clone_branches_are_not_safe(self):
+        commit(self.repo, "more.txt")
+        g(self.repo, "push", "-q")
+        shallow = self.tmp / "shallow"
+        g(self.tmp, "clone", "-q", "--depth", "1", "--no-local", str(self.remote), "shallow")
+        g(shallow, "switch", "-qc", "side")
+        g(shallow, "push", "-q", "-u", "origin", "side")
+        g(shallow, "switch", "-q", "main")
+        g(shallow, "fetch", "-q")
+        s = rp.scan_repo(str(shallow))
+        self.assertTrue(s["features"]["shallow"])
+        self.assertEqual(by_target(s, "branch", "side")["status"], "review")
+
+    def test_features_and_remote_health(self):
+        Path(self.repo, ".gitattributes").write_text("*.psd filter=lfs diff=lfs merge=lfs -text\n")
+        g(self.repo, "config", "branch.ghost.remote", "upstream")
+        g(self.repo, "remote", "add", "mirror", str(self.tmp / "deleted-mirror.git"))
+        s = self.scan()
+        self.assertTrue(s["features"]["lfs"])
+        texts = [n["text"] for n in s["remote_health"]]
+        self.assertTrue(any("ghost tracks remote 'upstream'" in t for t in texts))
+        self.assertTrue(any("mirror" in t and "no longer exists" in t for t in texts))
+        self.assertTrue(any("ghost tracks" in n for n in s["attention"]))
+
+    def test_detached_head_commits_are_flagged(self):
+        g(self.repo, "switch", "-q", "--detach")
+        commit(self.repo, "floating.txt")
+        s = self.scan()
+        self.assertEqual(s["detached_orphans"], 1)
+        self.assertTrue(any("on no branch" in n for n in s["attention"]))
 
 
 class TestActiveWorktree(Fixture):

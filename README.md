@@ -25,7 +25,7 @@ repositories, clones and AI-agent worktrees. Sibling of [Prism](https://github.c
 
 ## Install (Windows)
 
-1. Install **[Python 3.10+](https://www.python.org/downloads/)** with the `py` launcher (the default installer option). Git must be on `PATH`.
+1. Install **[Python 3.11+](https://www.python.org/downloads/)** with the `py` launcher (the default installer option). Git must be on `PATH`.
 2. Download **`RepoPulse-<version>-win-x64.zip`** from the [latest release](https://github.com/kumarnabh/repo-pulse/releases/latest) and unzip it anywhere you can write to (for example `%USERPROFILE%\Apps\RepoPulse`).
 3. Run **`Launch Repo Pulse.cmd`**.
 
@@ -76,6 +76,11 @@ python repopulse.py sync   --repo "D:\Code\app" [--push]
 python repopulse.py clean  --repo "D:\Code\app" --ids ID1,ID2   # ids are shown by scan --text
 python repopulse.py clean  --repo "D:\Code\app" --ids ID1,ID2 --review-ids ID2 --dry-run
 python repopulse.py verify --backup "%USERPROFILE%\RepoPulse Backups\app-1a2b3c4d\20261031-120000"
+python repopulse.py restore --backup "<backup folder>" [--overwrite] [--dry-run]   # files, branches, stashes
+python repopulse.py ops                 # what was cleaned, with operation ids
+python repopulse.py undo --op OP_ID     # put a branch, worktree or recycled folder back
+python repopulse.py recover             # after a crash: what was cut short and how to recover it
+python repopulse.py backups --verify    # every backup, its integrity, size and restore command
 ```
 
 Every command except `--text` prints one JSON object (see [SPEC.md](SPEC.md) for the fields).
@@ -90,7 +95,7 @@ Tool-history files (`~/.claude.json`, Codex and editor state) are only read, nev
 
 ## Build from source
 
-Needs Python 3.10+ and the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
+Needs Python 3.11+ and the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 
 ```
 git clone https://github.com/kumarnabh/repo-pulse.git
