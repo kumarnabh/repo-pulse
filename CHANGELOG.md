@@ -3,6 +3,35 @@
 All notable changes. Versions follow [semantic versioning](https://semver.org/); releases are on
 [GitHub](https://github.com/kumarnabh/repo-pulse/releases).
 
+## 0.5.0 — unreleased
+
+Safety, backup and recovery reliability.
+
+### Safety fixes
+- **Review items need their own approval.** The widget used to pass `--allow-review` for a whole repository whenever one selected item was Review, so an item selected as Safe that turned Review before cleanup (for example, the fetch went stale) was removed anyway. Review items are now approved one by one (`--review-ids`).
+- **Every item is re-checked right before its own action**, not once per batch, so earlier removals in the same batch and other tools are accounted for. Only one cleanup runs per repository at a time.
+- **Compare-and-delete for branches.** A branch is deleted only if it still points at the commit that was checked and bundled; if a coding agent commits to it meanwhile, it is kept.
+- **Ignored files are saved before a worktree is removed.** `.env`, local config and data files in a Review worktree are copied out and hash-verified first; if a copy fails, the worktree is kept.
+- **Worktrees in use are kept.** A worktree with files changed in the last 30 minutes, or with a merge, rebase or index lock in progress, is never offered.
+- **Stale worktree metadata is pruned one entry at a time.** `git worktree prune` removed every stale entry, including ones not selected. A stale detached worktree whose HEAD is the only reference to some commits is now kept.
+- Branches being rebased, and long-lived names (`develop`, `release/*`, `staging`, …), are never Safe. Safe branches now say whether they are merged into the default branch or only pushed.
+- `git gc` is held while another git operation is running, and reports the space it actually freed instead of the estimate.
+- Links and junctions are never followed by backup, folder or cache cleanup.
+
+### Backup fixes
+- **Backups never overwrite each other.** Two repositories with the same name shared one backup folder, two backups in the same second collided, and branches such as `feat/x` and `feat_x` overwrote each other's bundle. Folders and bundles now have unique names.
+- **No false success.** A backup that misses a file, a patch, a stash or the bundle now reports `INCOMPLETE` (and the widget says so) instead of success.
+- **Backups are proven restorable.** Every file copy is hash-checked against its source (and refused if the source changed meanwhile), every patch is test-applied in a throwaway index, and the bundle must verify. Free space is checked first. New `verify` command re-checks an old backup.
+- Every backup and cleanup is recorded in `operations.jsonl` with its recovery command.
+
+### Bug fixes
+- A failed fetch no longer counts as fresh because git rewrote `FETCH_HEAD`.
+- Repositories whose default branch is `trunk`, `develop` or `init.defaultBranch` are recognised.
+- Failed git reads (status, branches, worktrees, stashes, comparisons) show as errors and `health: unknown` instead of a healthy-looking repository.
+- New untracked folders list each file, so counts, diffs and backups see real files.
+- Every existing global cache location is found, not only the first.
+- New `clean --dry-run` reports what would be removed, the space and how to recover it, without changing anything.
+
 ## 0.4.0 — 2026-10-11
 
 ### Platform

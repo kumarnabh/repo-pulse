@@ -50,6 +50,7 @@ class Fixture(unittest.TestCase):
         # resolve() expands Windows 8.3 short names (RUNNER~1) so paths match what git reports
         self.tmp = Path(tempfile.mkdtemp(prefix="repopulse-")).resolve()
         os.environ["REPOPULSE_TRASH"] = str(self.tmp / "backups")
+        rp.ACTIVE_MINUTES = 0  # fixtures are seconds old; TestActiveWorktree turns the in-use check back on
         # isolate tool-history hints (~/.claude.json etc.) from the machine running the tests
         self.home = self.tmp / "home"
         self.home.mkdir()
@@ -429,7 +430,7 @@ class TestCleanBranches(Fixture):
             ["clean", "--repo", str(self.repo), "--ids", it["id"], "--dest", str(self.dest)]))
         self.assertTrue(res["results"][0]["done"], res)
         self.assertNotIn("pushed", g(self.repo, "branch", "--list", "pushed"))
-        bundle = next(Path(res["backup"]).glob("branch-pushed.bundle"))
+        bundle = next(Path(res["backup"]).glob("branch-pushed-*.bundle"))
         g(self.repo, "fetch", "-q", str(bundle), "pushed:pushed")
         self.assertEqual(g(self.repo, "rev-parse", "pushed"), tip)
 
@@ -585,6 +586,314 @@ class TestDiscoveryAndCli(Fixture):
         data = rp.cmd_scan(rp.build_parser().parse_args(["scan", "--roots", str(self.tmp / "code")]))
         self.assertTrue(data["ok"])
         self.assertTrue(any(r.get("error") for r in data["repos"]))
+
+
+def clean(*argv):
+    return rp.cmd_clean(rp.build_parser().parse_args(["clean", *argv]))
+
+
+def backup(*argv):
+    return rp.cmd_backup(rp.build_parser().parse_args(["backup", *argv]))
+
+
+class TestReleaseSafety(Fixture):
+    """Regressions for the 0.5 safety release: backups, approvals, races and recovery."""
+
+    def pushed_branch(self, name, file=None):
+        g(self.repo, "switch", "-qc", name, "main")
+        commit(self.repo, file or f"{name.replace('/', '-')}.txt")
+        g(self.repo, "push", "-q", "-u", "origin", name)
+        g(self.repo, "switch", "-q", "main")
+        return g(self.repo, "rev-parse", name)
+
+    def test_similar_branch_names_get_separate_bundles(self):
+        tips = {n: self.pushed_branch(n) for n in ("feat/x", "feat_x")}
+        self.fetch()
+        s = self.scan()
+        ids = [by_target(s, "branch", n)["id"] for n in tips]
+        res = clean("--repo", str(self.repo), "--ids", ",".join(ids), "--dest", str(self.dest))
+        self.assertTrue(all(r["done"] for r in res["results"]), res)
+        bundles = sorted(Path(res["backup"]).glob("branch-feat_x-*.bundle"))
+        self.assertEqual(len(bundles), 2)
+        for name, tip in tips.items():
+            r = next(r for r in res["results"] if r["target"] == name)
+            g(self.repo, "fetch", "-q", r["recovery"].split('"')[1], f"{name}:{name}")
+            self.assertEqual(g(self.repo, "rev-parse", name), tip)
+
+    def test_backup_folders_never_collide(self):
+        twin = self.tmp / "elsewhere" / "app"
+        twin.parent.mkdir()
+        g(twin.parent, "clone", "-q", str(self.remote), "app")
+        for repo in (self.repo, twin):
+            Path(repo, "README.md").write_text(f"edited in {repo.parent.name}")
+        a = backup("--repo", str(self.repo), "--dest", str(self.dest))
+        b = backup("--repo", str(twin), "--dest", str(self.dest))
+        c = backup("--repo", str(self.repo), "--dest", str(self.dest))  # same repo, same second
+        self.assertEqual(len({a["backup"], b["backup"], c["backup"]}), 3)
+        self.assertEqual((Path(b["backup"]) / "files" / "README.md").read_text(), "edited in elsewhere")
+        self.assertEqual((Path(a["backup"]) / "files" / "README.md").read_text(), "edited in code")
+
+    def test_failed_copy_makes_backup_incomplete(self):
+        Path(self.repo, "README.md").write_text("changed")
+        Path(self.repo, "locked.txt").write_text("in use")
+        real = rp.copy_verified
+
+        def flaky(src, dst):
+            if src.endswith("locked.txt"):
+                raise PermissionError(13, "The process cannot access the file")
+            return real(src, dst)
+        rp.copy_verified = flaky
+        try:
+            res = backup("--repo", str(self.repo), "--dest", str(self.dest))
+        finally:
+            rp.copy_verified = real
+        self.assertFalse(res["ok"])
+        self.assertFalse(res["complete"])
+        self.assertIn("INCOMPLETE", res["error"])
+        self.assertEqual([f["path"] for f in res["failed"]], ["locked.txt"])
+        self.assertTrue((Path(res["backup"]) / "INCOMPLETE").exists())
+        self.assertTrue((Path(res["backup"]) / "files" / "README.md").exists())  # the rest is still saved
+
+    def test_backup_is_hashed_restorable_and_verifiable(self):
+        Path(self.repo, "README.md").write_text("hello\nworld\n")
+        g(self.repo, "add", "README.md")
+        Path(self.repo, "README.md").write_text("hello\nworld\nagain\n")
+        Path(self.repo, "new", "deep").mkdir(parents=True)
+        Path(self.repo, "new", "deep", "n.txt").write_text("new")
+        res = backup("--repo", str(self.repo), "--dest", str(self.dest))
+        self.assertTrue(res["ok"], res)
+        b = Path(res["backup"])
+        self.assertFalse((b / "INCOMPLETE").exists())
+        manifest = json.loads((b / "manifest.json").read_text())
+        self.assertIn("files/new/deep/n.txt", manifest["sha256"])
+        self.assertIn("staged.patch", manifest["sha256"])
+        v = rp.cmd_verify(rp.build_parser().parse_args(["verify", "--backup", str(b)]))
+        self.assertTrue(v["ok"], v)
+        (b / "files" / "README.md").write_text("tampered")
+        v = rp.cmd_verify(rp.build_parser().parse_args(["verify", "--backup", str(b)]))
+        self.assertFalse(v["ok"])
+        self.assertEqual(v["bad"][0]["path"], "files/README.md")
+
+    def test_ignored_files_are_saved_before_worktree_removal(self):
+        Path(self.repo, ".gitignore").write_text(".env\nlocal/\n")
+        g(self.repo, "add", ".gitignore")
+        g(self.repo, "commit", "-qm", "ignore")
+        g(self.repo, "push", "-q")
+        wt = self.tmp / "wts" / "secret"
+        g(self.repo, "worktree", "add", "-q", str(wt), "-b", "wt-secret")
+        g(wt, "push", "-q", "-u", "origin", "wt-secret")
+        (wt / ".env").write_text("TOKEN=only-copy")
+        (wt / "local").mkdir()
+        (wt / "local" / "db.sqlite").write_bytes(b"\x00data")
+        self.fetch()
+        it = by_target(self.scan(), "worktree", str(wt))
+        self.assertEqual(it["status"], "review")
+        res = clean("--repo", str(self.repo), "--ids", it["id"], "--review-ids", it["id"], "--dest", str(self.dest))
+        self.assertTrue(res["results"][0]["done"], res)
+        self.assertFalse(wt.exists())
+        saved = next(Path(res["backup"]).glob("worktree-secret-*"))
+        self.assertEqual((saved / "ignored" / ".env").read_text(), "TOKEN=only-copy")
+        self.assertEqual((saved / "ignored" / "local" / "db.sqlite").read_bytes(), b"\x00data")
+
+    def test_item_that_became_review_is_not_removed_with_other_review_items(self):
+        Path(self.repo, ".gitignore").write_text("dist/\n")
+        g(self.repo, "add", ".gitignore")
+        g(self.repo, "commit", "-qm", "ignore")
+        g(self.repo, "push", "-q")
+        (self.repo / "dist").mkdir()
+        (self.repo / "dist" / "a.js").write_text("x")
+        self.pushed_branch("done")
+        self.fetch()
+        s = self.scan()
+        branch, dist = by_target(s, "branch", "done"), by_target(s, "folder", "dist")
+        self.assertEqual((branch["status"], dist["status"]), ("safe", "review"))
+        old = time.time() - 48 * 3600  # fetch goes stale between selection and cleanup: branch is Review now
+        os.utime(self.repo / ".git" / "FETCH_HEAD", (old, old))
+        res = clean("--repo", str(self.repo), "--ids", f"{branch['id']},{dist['id']}", "--review-ids", dist["id"],
+                    "--dest", str(self.dest))
+        by = {r["target"]: r for r in res["results"]}
+        self.assertTrue(by["dist"]["done"])
+        self.assertFalse(by["done"]["done"])
+        self.assertIn("select it again", by["done"]["reason"])
+        self.assertIn("done", g(self.repo, "branch", "--list", "done"))
+
+    def test_branch_moved_by_another_tool_is_not_deleted(self):
+        self.pushed_branch("racing")
+        self.fetch()
+        repo = rp.Repo(str(self.repo))
+        it = rp.revalidate(str(self.repo), by_target(self.scan(), "branch", "racing"))
+        self.assertEqual(it["status"], "safe")
+        g(self.repo, "switch", "-q", "racing")  # an agent commits right after the last check
+        commit(self.repo, "agent.txt")
+        g(self.repo, "switch", "-q", "main")
+        moved = g(self.repo, "rev-parse", "racing")
+        with self.assertRaises(RuntimeError) as ctx:
+            rp.execute(repo, it, lambda: rp.unique_dir(self.dest, "race"), False)
+        self.assertIn("changed since it was checked", str(ctx.exception))
+        self.assertEqual(g(self.repo, "rev-parse", "racing"), moved)
+
+    def test_branch_being_rebased_is_kept(self):
+        self.pushed_branch("topic")
+        self.fetch()
+        rb = self.repo / ".git" / "rebase-merge"
+        rb.mkdir()
+        (rb / "head-name").write_text("refs/heads/topic\n")
+        self.assertEqual(by_target(self.scan(), "branch", "topic")["reason"], "Being rebased")
+
+    def test_merged_and_pushed_are_told_apart(self):
+        self.pushed_branch("only-pushed")
+        self.pushed_branch("release/1.0")
+        self.fetch()
+        s = self.scan()
+        it = by_target(s, "branch", "only-pushed")
+        self.assertEqual((it["status"], it["merged"]), ("safe", False))
+        self.assertIn("not merged", it["reason"])
+        self.assertEqual(by_target(s, "branch", "release/1.0")["status"], "review")
+        g(self.repo, "merge", "-q", "--ff-only", "only-pushed")
+        g(self.repo, "push", "-q")
+        self.fetch()
+        it = by_target(self.scan(), "branch", "only-pushed")
+        self.assertTrue(it["merged"])
+        self.assertIn("Merged into origin/main", it["reason"])
+
+    def test_precise_prune_leaves_other_stale_worktrees(self):
+        wts = self.tmp / "wts"
+        for n in ("one", "two"):
+            g(self.repo, "worktree", "add", "-q", str(wts / n), "-b", f"wt-{n}")
+            shutil.rmtree(wts / n)
+        s = self.scan()
+        one = by_target(s, "worktree", str(wts / "one"))
+        res = clean("--repo", str(self.repo), "--ids", one["id"], "--dest", str(self.dest))
+        self.assertTrue(res["results"][0]["done"], res)
+        listed = [l[9:].replace("\\", "/") for l in g(self.repo, "worktree", "list", "--porcelain").splitlines()
+                  if l.startswith("worktree ")]
+        self.assertFalse(any(p.endswith("/one") for p in listed))
+        self.assertTrue(any(p.endswith("/two") for p in listed))
+
+    def test_stale_detached_worktree_with_unique_commits_is_kept(self):
+        wt = self.tmp / "wts" / "detached"
+        g(self.repo, "worktree", "add", "-q", "--detach", str(wt))
+        commit(wt, "only-here.txt")
+        shutil.rmtree(wt)
+        it = by_target(self.scan(), "worktree", str(wt))
+        self.assertEqual(it["status"], "keep")
+        self.assertIn("orphan", it["reason"])
+
+    def test_dry_run_changes_nothing(self):
+        self.pushed_branch("old")
+        self.fetch()
+        it = by_target(self.scan(), "branch", "old")
+        res = clean("--repo", str(self.repo), "--ids", it["id"], "--dry-run", "--dest", str(self.dest))
+        self.assertTrue(res["dry_run"])
+        self.assertTrue(res["results"][0]["would"])
+        self.assertFalse(res["results"][0]["done"])
+        self.assertIn("old", g(self.repo, "branch", "--list", "old"))
+        self.assertFalse(self.dest.exists())
+
+    def test_concurrent_cleanup_is_refused(self):
+        self.pushed_branch("old")
+        self.fetch()
+        it = by_target(self.scan(), "branch", "old")
+        lock = rp.acquire_lock(rp.Repo(str(self.repo)))
+        try:
+            res = clean("--repo", str(self.repo), "--ids", it["id"], "--dest", str(self.dest))
+        finally:
+            lock.unlink()
+        self.assertFalse(res["ok"])
+        self.assertIn("Another Repo Pulse cleanup", res["error"])
+        res = clean("--repo", str(self.repo), "--ids", it["id"], "--dest", str(self.dest))
+        self.assertTrue(res["results"][0]["done"], res)
+        history = (self.dest / "operations.jsonl").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(json.loads(history[-1])["target"], "old")
+
+    def test_gc_is_held_while_git_is_busy(self):
+        rp.GC_THRESHOLD, saved = 0, rp.GC_THRESHOLD
+        try:
+            Path(self.repo, "loose.txt").write_text("loose object")
+            g(self.repo, "add", "loose.txt")
+            (self.repo / ".git" / "MERGE_HEAD").write_text(g(self.repo, "rev-parse", "HEAD"))
+            self.assertEqual(rp.gc_item(rp.Repo(str(self.repo)))["status"], "keep")
+            (self.repo / ".git" / "MERGE_HEAD").unlink()
+            it = by_target(self.scan(), "gc", "git gc")
+            res = clean("--repo", str(self.repo), "--ids", it["id"], "--dest", str(self.dest))
+            self.assertTrue(res["results"][0]["done"], res)
+            self.assertIn("estimated", res["results"][0]["note"])
+        finally:
+            rp.GC_THRESHOLD = saved
+
+
+class TestEngineAccuracy(Fixture):
+    def test_failed_fetch_is_not_fresh(self):
+        r = rp.Repo(str(self.repo))
+        self.assertIsNone(r.fetch())
+        self.assertTrue(r.fresh())
+        # last success two days ago; then a fetch fails but still rewrites FETCH_HEAD (partial failure)
+        state_path = Path(r.git_dir, "repopulse-fetch.json")
+        state = json.loads(state_path.read_text())
+        state["origin"]["ok"] = time.time() - 48 * 3600
+        state_path.write_text(json.dumps(state))
+        g(self.repo, "remote", "set-url", "origin", str(self.tmp / "missing.git"))
+        self.assertIsNotNone(r.fetch())
+        failed_at = json.loads(state_path.read_text())["origin"]["failed"]
+        os.utime(Path(r.git_dir, "FETCH_HEAD"), (failed_at - 1, failed_at - 1))
+        self.assertFalse(rp.Repo(str(self.repo)).fresh())
+        # another tool fetching successfully afterwards makes it fresh again
+        later = failed_at + 5
+        os.utime(Path(r.git_dir, "FETCH_HEAD"), (later, later))
+        self.assertTrue(rp.Repo(str(self.repo)).fresh())
+
+    def test_trunk_default_branch(self):
+        remote = self.tmp / "trunk.git"
+        g(self.tmp, "init", "-q", "--bare", "--initial-branch=trunk", str(remote))
+        repo = self.tmp / "t"
+        g(self.tmp, "clone", "-q", str(remote), "t")
+        g(repo, "switch", "-qc", "trunk")
+        commit(repo, "a.txt")
+        g(repo, "push", "-q", "-u", "origin", "trunk")
+        self.assertEqual(rp.Repo(str(repo)).default, "trunk")
+        g(repo, "switch", "-qc", "side")
+        s = rp.scan_repo(str(repo))
+        self.assertEqual(s["default"], "trunk")
+        self.assertEqual(by_target(s, "branch", "trunk")["status"], "keep")
+
+    def test_git_failures_show_as_unknown(self):
+        real = rp.git_ok
+        rp.git_ok = lambda repo, *a, **k: None if a[:2] == ("stash", "list") else real(repo, *a, **k)
+        try:
+            s = self.scan()
+        finally:
+            rp.git_ok = real
+        self.assertEqual(s["health"], "unknown")
+        self.assertIn("Could not list stashes", s["attention"])
+
+    def test_untracked_folders_list_their_files(self):
+        Path(self.repo, "new", "a").mkdir(parents=True)
+        Path(self.repo, "new", "a", "1.txt").write_text("1")
+        Path(self.repo, "new", "2.txt").write_text("2")
+        s = self.scan()
+        self.assertEqual(s["dirty"]["untracked"], 2)
+        self.assertEqual(sorted(f["path"] for f in s["dirty"]["files"]), ["new/2.txt", "new/a/1.txt"])
+
+
+class TestActiveWorktree(Fixture):
+    def test_recently_used_worktree_is_kept(self):
+        rp.ACTIVE_MINUTES = 30
+        wt = self.tmp / "wts" / "agent"
+        g(self.repo, "worktree", "add", "-q", str(wt), "-b", "agent")
+        g(wt, "push", "-q", "-u", "origin", "agent")
+        self.fetch()
+        it = by_target(self.scan(), "worktree", str(wt))
+        self.assertEqual(it["status"], "keep")
+        self.assertIn("coding agent", it["reason"])
+        old = time.time() - 3600
+        for root, dirs, files in os.walk(wt):
+            for f in files:
+                os.utime(os.path.join(root, f), (old, old))
+        admin = rp.worktree_admin_dir(rp.Repo(str(self.repo)), str(wt))
+        for f in ("index", "HEAD", "logs/HEAD"):
+            if os.path.exists(os.path.join(admin, f)):
+                os.utime(os.path.join(admin, f), (old, old))
+        self.assertEqual(by_target(self.scan(), "worktree", str(wt))["status"], "safe")
 
 
 if __name__ == "__main__":

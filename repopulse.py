@@ -20,13 +20,18 @@ import urllib.parse
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 IS_WIN = os.name == "nt"
 FRESH_HOURS = 24
+ACTIVE_MINUTES = float(os.environ.get("REPOPULSE_ACTIVE_MINUTES") or 30)  # 0 disables the in-use check
 GC_THRESHOLD = 50 * 1024 * 1024
+DEFAULT_NAMES = ("main", "master", "trunk", "develop")
+LONG_LIVED = re.compile(r"^(main|master|trunk|develop|development|dev|staging|production|prod|release|releases?/.+|hotfix/.+)$")
+BUSY_MARKERS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-merge", "rebase-apply", "index.lock")
 MAX_DEPTH = 6
 JUNK_DEPTH = 6
 DIFF_FILES = 60
@@ -99,9 +104,10 @@ def longp(path: str | Path) -> str:
     return p
 
 
-def git(repo: str | Path, *args: str, timeout: float = 60, stdin: bytes | None = None) -> tuple[int, str, str]:
+def git(repo: str | Path, *args: str, timeout: float = 60, stdin: bytes | None = None,
+        extra_env: dict | None = None) -> tuple[int, str, str]:
     cmd = ["git", "-C", str(repo), "-c", "core.quotepath=off", "-c", "color.ui=never", *args]
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GCM_INTERACTIVE="never", LC_ALL="C")
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GCM_INTERACTIVE="never", LC_ALL="C", **(extra_env or {}))
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WIN else 0
     try:
         r = subprocess.run(cmd, input=stdin, capture_output=True, timeout=timeout, env=env, creationflags=flags)
@@ -208,6 +214,139 @@ def default_roots() -> list[str]:
 
 def backup_root(dest: str | None) -> Path:
     return Path(dest) if dest else Path.home() / "RepoPulse Backups"
+
+
+def path_tag(path: str) -> str:
+    """Short stable tag for a path, so two repos named `app` never share a backup folder."""
+    return hashlib.sha1(os.path.normcase(os.path.abspath(path)).encode("utf-8")).hexdigest()[:8]
+
+
+def unique_dir(parent: Path, base: str) -> Path:
+    """Create and return parent/base, or parent/base-N when another run already took that name."""
+    parent.mkdir(parents=True, exist_ok=True)
+    for n in range(1000):
+        d = parent / (base if n == 0 else f"{base}-{n}")
+        try:
+            d.mkdir()
+            return d
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"Could not create a unique folder under {parent}")
+
+
+def unique_file(folder: Path, stem: str, ext: str) -> Path:
+    for n in range(1000):
+        p = folder / (f"{stem}{ext}" if n == 0 else f"{stem}-{n}{ext}")
+        if not os.path.lexists(p):
+            return p
+    raise RuntimeError(f"Could not pick a unique file name in {folder}")
+
+
+def free_bytes(path: Path) -> int | None:
+    p = Path(os.path.abspath(path))
+    while not p.exists() and p.parent != p:
+        p = p.parent
+    try:
+        return shutil.disk_usage(p).free
+    except OSError:
+        return None
+
+
+def file_sha256(path: str | Path) -> str:
+    h = hashlib.sha256()
+    with open(longp(path), "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def copy_verified(src: str, dst: Path) -> str:
+    """Copy one regular file and prove the copy: the copy must hash equal to the source, and the source
+    must not have changed while it was read. Raises OSError (the copy is removed) otherwise."""
+    os.makedirs(longp(dst.parent), exist_ok=True)
+    h = hashlib.sha256()
+    try:
+        with open(longp(src), "rb") as fi, open(longp(dst), "xb") as fo:
+            for chunk in iter(lambda: fi.read(1 << 20), b""):
+                h.update(chunk)
+                fo.write(chunk)
+            fo.flush()
+            os.fsync(fo.fileno())
+        shutil.copystat(longp(src), longp(dst))
+        digest = h.hexdigest()
+        if file_sha256(dst) != digest:
+            raise OSError("the copy does not match the source")
+        if file_sha256(src) != digest:
+            raise OSError("the file changed while it was being copied")
+        return digest
+    except OSError:
+        try:
+            os.chmod(longp(dst), stat.S_IWRITE)
+            os.remove(longp(dst))
+        except OSError:
+            pass
+        raise
+
+
+def copy_tree_verified(root: str, rel: str, dest_root: Path) -> tuple[dict[str, str], list[dict]]:
+    """copy_verified for a file or folder under root. Links are never followed: they are recorded."""
+    hashes: dict[str, str] = {}
+    problems: list[dict] = []
+    stack = [rel.rstrip("/\\")]
+    while stack:
+        cur = stack.pop()
+        full = os.path.join(root, cur)
+        try:
+            st = os.lstat(longp(full))
+        except OSError as exc:
+            problems.append({"path": cur, "error": exc.strerror or str(exc)})
+            continue
+        if stat.S_ISLNK(st.st_mode) or is_junction(full):
+            problems.append({"path": cur, "error": "link not followed", "link": True})
+        elif stat.S_ISDIR(st.st_mode):
+            try:
+                stack += [os.path.join(cur, n) for n in os.listdir(longp(full))]
+            except OSError as exc:
+                problems.append({"path": cur, "error": exc.strerror or str(exc)})
+        elif stat.S_ISREG(st.st_mode):
+            try:
+                hashes[cur.replace("\\", "/")] = copy_verified(full, dest_root / cur)
+            except OSError as exc:
+                problems.append({"path": cur, "error": exc.strerror or str(exc)})
+    return hashes, problems
+
+
+def is_junction(path: str) -> bool:
+    fn = getattr(os.path, "isjunction", None)  # Python 3.12+
+    if fn:
+        return fn(path)
+    if not IS_WIN:
+        return False
+    try:
+        return bool(os.lstat(path).st_file_attributes & 0x400) and not os.path.islink(path)  # FILE_ATTRIBUTE_REPARSE_POINT
+    except (OSError, AttributeError):
+        return False
+
+
+def write_json_atomic(path: Path, data) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def log_operation(dest: str | None, record: dict) -> None:
+    """Append one line to the operation history next to the backups. Never fails the action itself."""
+    try:
+        root = backup_root(dest)
+        root.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "version": VERSION, **record}, ensure_ascii=False)
+        with open(root / "operations.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------- discovery
@@ -398,10 +537,13 @@ class Repo:
             sym = git_ok(self.path, "symbolic-ref", "--quiet", "--short", f"refs/remotes/{self.remote}/HEAD")
             if sym and "/" in sym.strip():
                 return sym.strip().split("/", 1)[1]
-            for b in ("main", "master"):
+        configured = (git_ok(self.path, "config", "--get", "init.defaultBranch") or "").strip()
+        names = ([configured] if configured else []) + [b for b in DEFAULT_NAMES if b != configured]
+        if self.remote:
+            for b in names:
                 if self.ref_exists(f"refs/remotes/{self.remote}/{b}"):
                     return b
-        for b in ("main", "master"):
+        for b in names:
             if self.ref_exists(f"refs/heads/{b}"):
                 return b
         cur = git_ok(self.path, "symbolic-ref", "--quiet", "--short", "HEAD")
@@ -410,16 +552,92 @@ class Repo:
     def ref_exists(self, ref: str) -> bool:
         return git_ok(self.path, "rev-parse", "--verify", "-q", ref) is not None
 
-    def fetched_age_h(self) -> float | None:
-        fh = os.path.join(self.git_dir, "FETCH_HEAD")
+    def _fetch_state_path(self) -> str:
+        return os.path.join(self.git_dir, "repopulse-fetch.json")
+
+    def fetch_state(self) -> dict:
         try:
-            return round((now() - os.path.getmtime(fh)) / 3600, 2)
+            with open(self._fetch_state_path(), encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _record_fetch(self, ok: bool) -> None:
+        state = self.fetch_state()
+        entry = state.get(self.remote) if isinstance(state.get(self.remote), dict) else {}
+        entry["ok" if ok else "failed"] = now()
+        state[self.remote] = entry
+        try:
+            write_json_atomic(Path(self._fetch_state_path()), state)
         except OSError:
-            return None
+            pass
+
+    def last_fetch(self) -> float | None:
+        """Time of the last fetch of this repo's remote known to have succeeded.
+
+        FETCH_HEAD is shared by every remote and is rewritten even by a fetch that fails part-way, so a
+        fetch that Repo Pulse saw fail only counts as fresh again after a later successful fetch, or after
+        FETCH_HEAD is rewritten by another tool after that failure.
+        """
+        entry = self.fetch_state().get(self.remote) or {}
+        ok_t, fail_t = entry.get("ok"), entry.get("failed")
+        times = [ok_t] if isinstance(ok_t, (int, float)) else []
+        try:
+            fh = os.path.getmtime(os.path.join(self.git_dir, "FETCH_HEAD"))
+            if not isinstance(fail_t, (int, float)) or fh > fail_t:
+                times.append(fh)
+        except OSError:
+            pass
+        return max(times) if times else None
+
+    def fetched_age_h(self) -> float | None:
+        t = self.last_fetch()
+        return None if t is None else round((now() - t) / 3600, 2)
 
     def fresh(self) -> bool:
         age = self.fetched_age_h()
         return age is not None and age <= FRESH_HOURS
+
+    def admin_dirs(self) -> list[str]:
+        """The common git dir plus every linked worktree's private git dir."""
+        dirs = [self.git_dir]
+        root = os.path.join(self.git_dir, "worktrees")
+        try:
+            dirs += [os.path.join(root, n) for n in os.listdir(root)]
+        except OSError:
+            pass
+        return dirs
+
+    def busy(self) -> list[str]:
+        """Git operations in progress anywhere in this repository (merge, rebase, bisect, a held index lock)."""
+        found = []
+        for d in self.admin_dirs():
+            for m in BUSY_MARKERS:
+                if os.path.exists(os.path.join(d, m)):
+                    found.append(f"{m} in {os.path.basename(d) if d != self.git_dir else 'main worktree'}")
+        for m in ("gc.pid", "packed-refs.lock", "shallow.lock"):
+            if os.path.exists(os.path.join(self.git_dir, m)):
+                found.append(m)
+        return found
+
+    def rebasing_branches(self) -> set[str]:
+        names = set()
+        for d in self.admin_dirs():
+            for sub in ("rebase-merge", "rebase-apply"):
+                try:
+                    with open(os.path.join(d, sub, "head-name"), encoding="utf-8") as fh:
+                        names.add(fh.read().strip().removeprefix("refs/heads/"))
+                except OSError:
+                    pass
+        return names
+
+    def integrated(self, rev: str) -> bool | None:
+        """True when rev is already part of the remote default branch (merged), not just pushed somewhere."""
+        if not self.remote or not self.default or not self.ref_exists(f"refs/remotes/{self.remote}/{self.default}"):
+            return None
+        code, _, _ = git(self.path, "merge-base", "--is-ancestor", rev, f"refs/remotes/{self.remote}/{self.default}")
+        return True if code == 0 else False if code == 1 else None
 
     def unpushed(self, rev: str) -> int | None:
         if not self.remote:
@@ -447,10 +665,14 @@ class Repo:
         if not self.remote:
             return None
         code, _, err = git(self.path, "fetch", "--prune", "--no-tags", "--quiet", self.remote, timeout=timeout)
+        self._record_fetch(code == 0)
         return None if code == 0 else (err.splitlines()[-1] if err else f"fetch failed ({code})")
 
-    def worktrees(self) -> list[dict]:
-        out = git_ok(self.path, "worktree", "list", "--porcelain") or ""
+    def worktrees(self) -> list[dict] | None:
+        """Parsed `git worktree list`; None when git could not list them."""
+        out = git_ok(self.path, "worktree", "list", "--porcelain")
+        if out is None:
+            return None
         trees, cur = [], None
         for line in out.splitlines():
             if line.startswith("worktree "):
@@ -504,16 +726,20 @@ def parse_status(text: str) -> dict:
 
 
 def dirty_state(path: str) -> dict:
-    code, out, err = git(path, "status", "--porcelain=v1", "-z", "--untracked-files=normal", timeout=90)
+    # "all" lists each file inside a new folder, so counts, previews and backups see real files
+    code, out, err = git(path, "status", "--porcelain=v1", "-z", "--untracked-files=all", timeout=90)
     if code != 0:
         return {"counts": {"total": 0}, "files": [], "error": err or "status failed"}
     return parse_status(out)
 
 
-def numstat(repo: Repo) -> dict[str, tuple]:
+def numstat(repo: Repo) -> dict[str, tuple] | None:
+    """Line counts per changed path; None when git diff failed."""
     if not repo.has_head:
         return {}
-    out = git_ok(repo.path, "diff", "--numstat", "-z", "HEAD") or ""
+    out = git_ok(repo.path, "diff", "--numstat", "-z", "HEAD")
+    if out is None:
+        return None
     # -z: "add\trem\tpath\0", or for renames "add\trem\t\0old\0new\0"
     parts = out.split("\0")
     stats = {}
@@ -533,24 +759,35 @@ def numstat(repo: Repo) -> dict[str, tuple]:
 
 # ---------------------------------------------------------------- classification
 
-def classify_branches(repo: Repo, trees: list[dict]) -> list[dict]:
+def classify_branches(repo: Repo, trees: list[dict], only: str | None = None) -> list[dict] | None:
+    """None when git could not list the branches (the caller reports it instead of showing none)."""
     checked_out = {t["branch"] for t in trees if t.get("branch")}
-    fmt = "%(refname:short)%00%(upstream:short)%00%(upstream:track)%00%(objectname)%00%(committerdate:unix)"
-    out = git_ok(repo.path, "for-each-ref", f"--format={fmt}", "refs/heads") or ""
+    rebasing = repo.rebasing_branches()
+    fmt = "%(refname)%00%(upstream:short)%00%(upstream:track)%00%(objectname)%00%(committerdate:unix)"
+    pattern = f"refs/heads/{only}" if only else "refs/heads"
+    out = git_ok(repo.path, "for-each-ref", f"--format={fmt}", pattern)
+    if out is None:
+        return None
     fresh = repo.fresh()
     items = []
     for line in out.splitlines():
-        name, upstream, track, sha, when = (line.split("\0") + ["", "", "", "", "0"])[:5]
+        ref, upstream, track, sha, when = (line.split("\0") + ["", "", "", "", "0"])[:5]
+        name = ref.removeprefix("refs/heads/")
+        if only and name != only:
+            continue
         unpushed = repo.unpushed_tip(name, sha)
         gone = "[gone]" in track
+        merged = repo.integrated(sha) if unpushed == 0 else False
         base = {
             "kind": "branch", "target": name, "upstream": upstream or None, "upstream_gone": gone,
-            "head": sha, "unpushed": unpushed, "last_commit": int(when or 0), "bytes": 0,
+            "head": sha, "unpushed": unpushed, "merged": merged, "last_commit": int(when or 0), "bytes": 0,
         }
         if name == repo.default:
             status, reason = "keep", "Default branch"
         elif name in checked_out:
             status, reason = "keep", "Checked out in a worktree"
+        elif name in rebasing:
+            status, reason = "keep", "Being rebased"
         elif repo.remote is None:
             status, reason = "keep", "Repository has no remote"
         elif unpushed is None:
@@ -562,11 +799,73 @@ def classify_branches(repo: Repo, trees: list[dict]) -> list[dict]:
                 status, reason = "keep", f"{unpushed} unpushed commit(s)"
         elif not fresh:
             status, reason = "review", "Fully on remote at last fetch, but fetch is stale; fetch first"
+        elif LONG_LIVED.match(name):
+            status, reason = "review", "Long-lived branch name (release, develop, staging...); confirm it is retired"
+        elif merged:
+            status, reason = "safe", f"Merged into {repo.remote}/{repo.default}" + (" (upstream deleted)" if gone else "")
         else:
-            status, reason = "safe", "All commits are on the remote" + (" (upstream deleted)" if gone else "")
+            status, reason = "safe", "All commits are on a remote, but not merged into " \
+                                     f"{repo.remote}/{repo.default}" + (" (upstream deleted)" if gone else "")
         base.update(status=status, reason=reason)
         items.append(base)
     return items
+
+
+def worktree_admin_dir(repo: Repo, path: str) -> str | None:
+    """The private git dir (.git/worktrees/<id>) that belongs to the worktree at path."""
+    want = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    root = os.path.join(repo.git_dir, "worktrees")
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return None
+    for n in names:
+        d = os.path.join(root, n)
+        try:
+            with open(os.path.join(d, "gitdir"), encoding="utf-8", errors="replace") as fh:
+                gitdir = fh.read().strip()
+        except OSError:
+            continue
+        gitdir = os.path.normpath(os.path.join(d, gitdir))  # relative when worktree.useRelativePaths is set
+        if os.path.normcase(os.path.dirname(gitdir)) == want:
+            return d
+    return None
+
+
+def recent_activity(path: str, admin: str | None, minutes: float | None = None, budget: int = 50_000) -> float | None:
+    """Newest modification time (seconds ago) within the last `minutes`, or None if the worktree is quiet.
+
+    A coding agent or editor working in a worktree writes files and runs git (which refreshes the index),
+    so recent writes are the most reliable cross-platform sign that it is still in use.
+    """
+    cutoff = now() - (ACTIVE_MINUTES if minutes is None else minutes) * 60
+    newest = 0.0
+    for name in ("index", "HEAD", "logs/HEAD"):
+        if admin:
+            try:
+                newest = max(newest, os.path.getmtime(os.path.join(admin, name)))
+            except OSError:
+                pass
+    stack, seen = [longp(path)], 0
+    while stack and seen < budget and newest < cutoff:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for e in it:
+                    seen += 1
+                    try:
+                        if is_link_like(e):
+                            continue
+                        if e.is_dir(follow_symlinks=False):
+                            if e.name != ".git" and e.name not in JUNK_RULES:
+                                stack.append(e.path)
+                        else:
+                            newest = max(newest, e.stat(follow_symlinks=False).st_mtime)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return round(now() - newest) if newest >= cutoff else None
 
 
 def classify_worktrees(repo: Repo, trees: list[dict], measure: bool = True) -> list[dict]:
@@ -577,11 +876,22 @@ def classify_worktrees(repo: Repo, trees: list[dict], measure: bool = True) -> l
         if t["main"] or t["bare"]:
             continue
         exists = os.path.isdir(t["path"])
+        admin = worktree_admin_dir(repo, t["path"])
         base = {"kind": "worktree", "target": t["path"], "branch": t["branch"], "head": t["head"], "locked": t["locked"], "bytes": 0}
         if t["locked"]:
             base.update(status="keep", reason="Locked worktree")
         elif t["prunable"] or not exists:
-            base.update(status="safe", reason="Folder already gone; only stale metadata remains", action="prune")
+            orphans: int | None = 0
+            if t["head"] and not t["branch"]:  # a detached HEAD may be the only reference to its commits
+                out = git_ok(repo.path, "rev-list", "--count", t["head"], "--not", "--branches", "--tags", "--remotes")
+                orphans = int(out.strip()) if out and out.strip().isdigit() else None
+            if orphans != 0:
+                base.update(status="keep", reason="Folder is gone, but its detached HEAD is the only reference to "
+                                                  "commits on no remote; pruning would orphan them")
+            else:
+                base.update(status="safe", reason="Folder already gone; only stale metadata remains", action="prune")
+        elif admin and any(os.path.exists(os.path.join(admin, m)) for m in BUSY_MARKERS):
+            base.update(status="keep", reason="A git operation is in progress in this worktree")
         else:
             base["bytes"] = dir_size(t["path"]) if measure else None
             d = dirty_state(t["path"])
@@ -592,8 +902,13 @@ def classify_worktrees(repo: Repo, trees: list[dict], measure: bool = True) -> l
             else:  # detached HEAD: not covered by the branch-wide list
                 unp = repo.unpushed(t["head"])
             precious = precious_ignored(t["path"])
+            active = recent_activity(t["path"], admin)
+            base["precious"] = precious or []
             if d.get("error"):
                 base.update(status="keep", reason="Could not read worktree status")
+            elif active is not None:
+                base.update(status="keep", reason=f"Files changed {max(1, int(active // 60))} min ago; "
+                                                  "it may be in use by a coding agent or editor")
             elif d["counts"]["total"]:
                 base.update(status="keep", reason=f"{d['counts']['total']} uncommitted change(s)")
             elif unp is None:
@@ -603,9 +918,9 @@ def classify_worktrees(repo: Repo, trees: list[dict], measure: bool = True) -> l
             elif precious is None:
                 base.update(status="keep", reason="Could not list ignored files")
             elif precious:
-                shown = ", ".join(precious[:3]) + ("â€¦" if len(precious) > 3 else "")
-                base.update(status="review", reason=f"Clean and pushed, but removal also deletes {len(precious)} "
-                                                    f"ignored item(s) that exist nowhere else: {shown}")
+                shown = ", ".join(precious[:3]) + ("..." if len(precious) > 3 else "")
+                base.update(status="review", reason=f"Clean and pushed, but holds {len(precious)} ignored item(s) "
+                                                    f"that exist nowhere else ({shown}); they are backed up before removal")
             elif not fresh:
                 base.update(status="review", reason="Clean and pushed at last fetch; fetch first")
             else:
@@ -686,27 +1001,40 @@ def find_junk(repo: Repo) -> tuple[list[dict], int]:
     ignored = ignored_set(root, [c[0] for c in candidates])
     items = []
     for rel, name in candidates:
-        label, manifests, generic = JUNK_RULES[name]
-        full = os.path.join(root, rel)
-        parent = Path(full).parent
-        if name in (".venv", "venv") and not os.path.exists(os.path.join(full, "pyvenv.cfg")):
-            continue
-        size = dir_size(full)
-        total += size
-        base = {"kind": "folder", "target": rel, "label": label, "bytes": size}
-        rel_key = rel.replace("\\", "/")
-        if has_tracked(root, rel):
-            base.update(status="keep", reason="Contains files tracked by git")
-        elif rel_key not in ignored:
-            base.update(status="review", reason="Not git-ignored; confirm it is generated")
-        elif generic:
-            base.update(status="review", reason="Generic build folder; confirm it can be rebuilt")
-        elif not has_manifest(parent, manifests):
-            base.update(status="review", reason="Rebuild manifest not found next to it")
-        else:
-            base.update(status="safe", reason="Ignored, untracked and rebuildable")
-        items.append(base)
+        item = classify_folder(root, rel, ignored)
+        if item:
+            total += item["bytes"]
+            items.append(item)
     return items, total
+
+
+def classify_folder(root: str, rel: str, ignored: set[str] | None = None, measure: bool = True) -> dict | None:
+    """One junk-folder candidate; `ignored` is a precomputed check-ignore result (computed here when None)."""
+    name = os.path.basename(rel.rstrip("\\/"))
+    rule = JUNK_RULES.get(name)
+    full = os.path.join(root, rel)
+    if not rule or not os.path.isdir(full) or os.path.islink(full) or is_junction(full):
+        return None
+    label, manifests, generic = rule
+    if name in (".venv", "venv") and not os.path.exists(os.path.join(full, "pyvenv.cfg")):
+        return None
+    if ignored is None:
+        ignored = ignored_set(root, [rel])
+    base = {"kind": "folder", "target": rel, "label": label, "bytes": dir_size(full) if measure else None}
+    rel_key = rel.replace("\\", "/")
+    if not within(full, root):
+        base.update(status="keep", reason="Resolves outside the repository")
+    elif has_tracked(root, rel):
+        base.update(status="keep", reason="Contains files tracked by git")
+    elif rel_key not in ignored:
+        base.update(status="review", reason="Not git-ignored; confirm it is generated")
+    elif generic:
+        base.update(status="review", reason="Generic build folder; confirm it can be rebuilt")
+    elif not has_manifest(Path(full).parent, manifests):
+        base.update(status="review", reason="Rebuild manifest not found next to it")
+    else:
+        base.update(status="safe", reason="Ignored, untracked and rebuildable")
+    return base
 
 
 def gc_item(repo: Repo) -> dict | None:
@@ -722,8 +1050,12 @@ def gc_item(repo: Repo) -> dict | None:
     loose = (vals.get("size", 0) + vals.get("size-garbage", 0)) * 1024
     if loose < GC_THRESHOLD:
         return None
-    return {"kind": "gc", "target": "git gc", "bytes": loose, "status": "safe",
-            "reason": f"{human(loose)} of loose or garbage objects; git gc packs them"}
+    item = {"kind": "gc", "target": "git gc", "bytes": loose, "estimate": True, "status": "safe",
+            "reason": f"Up to {human(loose)} of loose or garbage objects; git gc packs them (actual savings are usually smaller)"}
+    busy = repo.busy()
+    if busy:
+        item.update(status="keep", reason="A git operation is in progress: " + ", ".join(busy[:3]))
+    return item
 
 
 # ---------------------------------------------------------------- scan
@@ -740,6 +1072,16 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
     if is_wt:
         parent = os.path.normpath(os.path.dirname(repo.git_dir.rstrip("/\\")))
         result.update(parent=parent, parent_name=os.path.basename(parent))
+    errors: list[str] = []
+
+    def counts(out: str | None, what: str) -> tuple[int, int]:
+        try:
+            a, b = (int(x) for x in (out or "").split())
+            return a, b
+        except ValueError:
+            errors.append(f"Could not compare {what}")
+            return 0, 0
+
     if do_fetch and not is_wt:
         result["fetch_error"] = repo.fetch()
     result["fetched_age_h"] = repo.fetched_age_h()
@@ -753,10 +1095,13 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
     result["upstream"] = up.strip() if up else None
     b_ahead = b_behind = 0
     if result["upstream"]:
-        out = git_ok(repo.path, "rev-list", "--left-right", "--count", "HEAD...@{u}") or "0\t0"
-        b_ahead, b_behind = (int(x) for x in out.split())
+        b_ahead, b_behind = counts(git_ok(repo.path, "rev-list", "--left-right", "--count", "HEAD...@{u}"),
+                                   f"{result['branch']} with {result['upstream']}")
     elif repo.has_head and repo.remote:
-        b_ahead = repo.unpushed("HEAD") or 0
+        n = repo.unpushed("HEAD")
+        if n is None:
+            errors.append("Could not count unpushed commits")
+        b_ahead = n or 0
     result.update(branch_ahead=b_ahead, branch_behind=b_behind)
 
     # main vs origin/main
@@ -768,9 +1113,10 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
         if not r or not repo.ref_exists(f"refs/remotes/{r}/{d}"):
             state = "no_remote"
         else:
-            out = git_ok(repo.path, "rev-list", "--left-right", "--count", f"refs/heads/{d}...refs/remotes/{r}/{d}") or "0\t0"
-            ahead, behind = (int(x) for x in out.split())
-            state = "in_sync" if not ahead and not behind else "diverged" if ahead and behind else "ahead" if ahead else "behind"
+            out = git_ok(repo.path, "rev-list", "--left-right", "--count", f"refs/heads/{d}...refs/remotes/{r}/{d}")
+            ahead, behind = counts(out, f"{d} with {r}/{d}")
+            state = "unknown" if out is None else "in_sync" if not ahead and not behind else \
+                "diverged" if ahead and behind else "ahead" if ahead else "behind"
     result.update(main_state=state, ahead=ahead, behind=behind)
     last = git_ok(repo.path, "log", "-1", "--format=%ct") if repo.has_head else None
     result["last_commit"] = int(last) if last and last.strip() else None
@@ -783,17 +1129,31 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
     stats = numstat(repo) if dstate["files"] else {}
     files = []
     for f in dstate["files"][:DIFF_FILES]:
-        add, rem = stats.get(f["path"], (None, None))
+        add, rem = (stats or {}).get(f["path"], (None, None))
         files.append({**f, "added": add, "removed": rem})
     result["dirty"] = {**dstate["counts"], "files": files, "truncated": len(dstate["files"]) > DIFF_FILES}
     if dstate.get("error"):
         result["dirty"]["error"] = dstate["error"]
-    stash = git_ok(repo.path, "stash", "list") or ""
-    result["stashes"] = len([l for l in stash.splitlines() if l.strip()])
+        errors.append("Could not read working-tree status: " + dstate["error"].splitlines()[-1])
+    if stats is None:
+        errors.append("Could not read line counts")
+    stash = git_ok(repo.path, "stash", "list")
+    if stash is None:
+        errors.append("Could not list stashes")
+    result["stashes"] = len([l for l in (stash or "").splitlines() if l.strip()])
 
     # branches, worktrees and git garbage belong to the main repository row only
-    trees = [] if is_wt else repo.worktrees()
-    items = [] if is_wt else classify_branches(repo, trees) + classify_worktrees(repo, trees, measure_worktrees)
+    trees: list[dict] = []
+    items: list[dict] = []
+    if not is_wt:
+        listed = repo.worktrees()
+        if listed is None:
+            errors.append("Could not list worktrees")
+        trees = listed or []
+        branches = classify_branches(repo, trees)
+        if branches is None:
+            errors.append("Could not list branches")
+        items = (branches or []) + (classify_worktrees(repo, trees, measure_worktrees) if listed is not None else [])
     junk, wt_bytes = find_junk(repo)
     items += junk
     g = None if is_wt else gc_item(repo)
@@ -807,6 +1167,8 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
     result["worktrees"] = len([t for t in trees if not t["main"]])
     result["worktree_bytes"] = wt_bytes
     result["git_bytes"] = 0 if is_wt else dir_size(repo.git_dir)
+    result["errors"] = errors
+    result["health"] = "unknown" if errors else "ok"
     tally_bytes(result)
     result["attention"] = attention(result)
     result["scan_ms"] = int((now() - started) * 1000)
@@ -820,7 +1182,7 @@ def tally_bytes(result: dict) -> None:
 
 
 def attention(r: dict) -> list[str]:
-    notes = []
+    notes = list(r.get("errors") or [])
     if r.get("fetch_error"):
         notes.append(f"Fetch failed: {r['fetch_error']}")
     b = r.get("branch")
@@ -852,16 +1214,21 @@ def attention(r: dict) -> list[str]:
 
 
 def scan_caches() -> list[dict]:
-    items = []
+    items, seen = [], set()
     for label, paths, status in CACHE_DIRS:
-        for p in paths:
+        for p in paths:  # every location that exists, not only the first (WSL-style homes, mixed installs)
             path = expand(p)
-            if path and path.is_dir():
-                size = dir_size(path)
-                items.append({"kind": "cache", "target": str(path), "label": label, "bytes": size, "status": status,
-                              "reason": "Re-downloaded on demand" if status == "safe" else "Rebuild needs network or a prune command",
-                              "id": item_id("cache", "", str(path))})
-                break
+            if not path or not path.is_dir() or path.is_symlink() or is_junction(str(path)):
+                continue
+            key = os.path.normcase(os.path.realpath(path))
+            if key in seen:
+                continue
+            seen.add(key)
+            size = dir_size(path)
+            reason = "Re-downloaded on demand; offline installs need network afterwards" if status == "safe" \
+                else "Shared by every project on this machine; rebuild needs network or a prune command"
+            items.append({"kind": "cache", "target": str(path), "label": label, "bytes": size, "status": status,
+                          "reason": reason, "id": item_id("cache", "", str(path))})
     return items
 
 
@@ -948,83 +1315,207 @@ def safe_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)[:80]
 
 
+def patch_applies(repo: Repo, patch: Path, base: str) -> bool | None:
+    """Restore drill: does the patch apply cleanly to `base`? Uses a throwaway index, so the repository's
+    own index and working tree are never touched. None when git could not run the check."""
+    fd, idx = tempfile.mkstemp(prefix="repopulse-index-")
+    os.close(fd)
+    os.remove(idx)  # read-tree wants to create it
+    env = {"GIT_INDEX_FILE": idx}
+    try:
+        code, _, _ = git(repo.path, "read-tree", base, extra_env=env)
+        if code != 0:
+            return None
+        code, _, _ = git(repo.path, "apply", "--cached", "--check", "--binary", str(patch), extra_env=env, timeout=120)
+        return code == 0
+    finally:
+        for p in (idx, idx + ".lock"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def bundle_holds(repo: Repo, bundle: Path, shas: list[str]) -> str | None:
+    """None when the bundle verifies against this repository and carries every sha as a ref tip; else why not."""
+    code, _, err = git(repo.path, "bundle", "verify", "--quiet", str(bundle), timeout=600)
+    if code != 0:
+        return f"bundle does not verify: {err}"
+    code, out, err = git(repo.path, "bundle", "list-heads", str(bundle), timeout=600)
+    if code != 0:
+        return f"could not list bundle refs: {err}"
+    tips = {line.split()[0] for line in out.splitlines() if line.strip()}
+    missing = [s for s in shas if s and s not in tips]
+    return f"bundle is missing {len(missing)} expected ref(s)" if missing else None
+
+
+def repo_backup_dir(dest: str | None, repo: Repo) -> Path:
+    return backup_root(dest) / f"{safe_name(repo.name)}-{path_tag(repo.path)}"
+
+
 def cmd_backup(args) -> dict:
     repo = Repo(args.repo)
-    dest = backup_root(args.dest) / safe_name(repo.name) / stamp()
-    files_dir = dest / "files"
+    problems: list[dict] = []  # anything not saved and proven restorable makes the backup incomplete
     changed: set[str] = set()
     deleted: list[str] = []
-    if repo.has_head:
-        out = git_ok(repo.path, "diff", "--name-only", "-z", "HEAD") or ""
-        changed.update(p for p in out.split("\0") if p)
-    else:
-        out = git_ok(repo.path, "ls-files", "-z", "--cached") or ""
-        changed.update(p for p in out.split("\0") if p)
-    out = git_ok(repo.path, "ls-files", "-z", "--others", "--exclude-standard") or ""
-    changed.update(p for p in out.split("\0") if p)
+    listing = [("diff", "--name-only", "-z", "HEAD")] if repo.has_head else [("ls-files", "-z", "--cached")]
+    for cmd in listing + [("ls-files", "-z", "--others", "--exclude-standard")]:
+        out = git_ok(repo.path, *cmd)
+        if out is None:
+            problems.append({"part": "files", "error": f"git {cmd[0]} failed; changed files may be missing"})
+        changed.update(p for p in (out or "").split("\0") if p)
     total = 0
-    present = []
+    present, links = [], []
     for rel in sorted(changed):
         src = os.path.join(repo.path, rel)
-        if os.path.isfile(src):
-            total += os.path.getsize(src)
-            present.append(rel)
-        elif not os.path.exists(src):
+        try:
+            st = os.lstat(longp(src))
+        except FileNotFoundError:
             deleted.append(rel)
+            continue
+        except OSError as exc:
+            problems.append({"part": "file", "path": rel, "error": exc.strerror or str(exc)})
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            try:
+                links.append({"path": rel, "target": os.readlink(src)})  # recorded, never followed
+            except OSError as exc:
+                problems.append({"part": "file", "path": rel, "error": exc.strerror or str(exc)})
+        elif not within(os.path.dirname(src) or repo.path, repo.path) and os.path.dirname(rel):
+            problems.append({"part": "file", "path": rel, "error": "a parent folder links outside the repository; not followed"})
+        elif stat.S_ISREG(st.st_mode):
+            total += st.st_size
+            present.append(rel)
     limit = int(args.max_gb * 1024 ** 3)
     if total > limit:
         return {"ok": False, "error": f"Dirty files total {human(total)}, above the {args.max_gb:g} GB backup limit. "
                                       f"Raise the limit or commit/ignore large assets first.", "bytes": total}
-    dest.mkdir(parents=True, exist_ok=False)
-    copied, failed = [], []
-    for rel in present:
-        target = files_dir / rel
+    parent = repo_backup_dir(args.dest, repo)
+    need = total * 2 + 64 * 1024 * 1024  # files plus patches of them, and room for bundles
+    free = free_bytes(parent)
+    if free is not None and free < need:
+        return {"ok": False, "error": f"Not enough free space for the backup at {parent}: {human(free)} free, "
+                                      f"about {human(need)} needed.", "bytes": total}
+    try:
+        dest = unique_dir(parent, stamp())
+        marker = dest / "INCOMPLETE"
+        marker.write_text("This backup was interrupted or failed verification. Do not rely on it.\n", encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "error": f"Cannot write to the backup folder {parent}: {exc.strerror or exc}"}
+
+    hashes: dict[str, str] = {}
+    for rel in present:  # a locked, vanished or changing file must not abort the rest of the backup
         try:
-            os.makedirs(longp(target.parent), exist_ok=True)
-            shutil.copy2(longp(os.path.join(repo.path, rel)), longp(target))
-            copied.append(rel)
-        except OSError as exc:  # a locked or vanished file must not abort the rest of the backup
-            failed.append({"path": rel, "error": exc.strerror or str(exc)})
+            hashes["files/" + rel] = copy_verified(os.path.join(repo.path, rel), dest / "files" / rel)
+        except OSError as exc:
+            problems.append({"part": "file", "path": rel, "error": exc.strerror or str(exc)})
+
+    def save_patch(name: str, raw: bytes, base: str) -> bool:
+        path = dest / name
+        path.write_bytes(raw)
+        hashes[name] = file_sha256(path)
+        ok = patch_applies(repo, path, base)
+        if ok is not True:
+            problems.append({"part": "patch", "path": name, "error": "could not test that it restores" if ok is None
+                             else f"does not apply cleanly to {base}"})
+        return ok is True
+
     if repo.has_head:
         for name, extra in (("changes.patch", ["HEAD"]), ("staged.patch", ["--cached"])):
             code, raw = git_bytes(repo.path, "diff", "--binary", *extra, timeout=120)
-            if code == 0 and raw:
-                (dest / name).write_bytes(raw)
-    bundle = None
-    refs = ["--branches"]
-    if repo.ref_exists("refs/stash"):
-        refs.append("refs/stash")
-    unp = repo.unpushed("--branches") if repo.remote else None
-    stash_n = len([l for l in (git_ok(repo.path, "stash", "list") or "").splitlines() if l.strip()])
+            if code != 0:
+                problems.append({"part": "patch", "path": name, "error": "git diff failed"})
+            elif raw:
+                save_patch(name, raw, "HEAD")
+    stash_list = git_ok(repo.path, "stash", "list")
+    if stash_list is None:
+        problems.append({"part": "stash", "error": "could not list stashes"})
+    stash_n = len([l for l in (stash_list or "").splitlines() if l.strip()])
     # the bundle can only carry refs/stash (the newest entry); every entry is also saved as a patch
     stash_patches = []
     for n in range(stash_n):
         code, raw = git_bytes(repo.path, "stash", "show", "-p", "--binary", "--include-untracked", f"stash@{{{n}}}", timeout=120)
         if code != 0:  # git < 2.32 has no --include-untracked for stash show
             code, raw = git_bytes(repo.path, "stash", "show", "-p", "--binary", f"stash@{{{n}}}", timeout=120)
-        if code == 0 and raw:
-            (dest / f"stash-{n}.patch").write_bytes(raw)
+        if code != 0:
+            problems.append({"part": "stash", "path": f"stash@{{{n}}}", "error": "git stash show failed"})
+        elif raw:
+            save_patch(f"stash-{n}.patch", raw, f"stash@{{{n}}}^1")
             stash_patches.append(f"stash-{n}.patch")
+
+    bundle = None
+    refs = ["--branches"]
+    stash_sha = (git_ok(repo.path, "rev-parse", "--verify", "-q", "refs/stash") or "").strip()
+    if stash_sha:
+        refs.append("refs/stash")
+    unp = repo.unpushed("--branches") if repo.remote else None
+    if repo.remote and unp is None:
+        problems.append({"part": "bundle", "error": "could not count unpushed commits"})
     if repo.has_head and (unp or stash_n or not repo.remote):
         neg = ["--not", "--remotes"] if repo.remote else []
-        code, _, err = git(repo.path, "bundle", "create", str(dest / "unpushed.bundle"), *refs, *neg, timeout=600)
-        bundle = {"file": "unpushed.bundle", "ok": code == 0, "error": None if code == 0 else err,
-                  "unpushed_commits": unp, "stashes": stash_n}
+        path = dest / "unpushed.bundle"
+        code, _, err = git(repo.path, "bundle", "create", str(path), *refs, *neg, timeout=600)
+        why = (f"bundle failed: {err}" if code != 0 else bundle_holds(repo, path, [stash_sha]))
+        if why:
+            problems.append({"part": "bundle", "path": "unpushed.bundle", "error": why})
+        else:
+            hashes["unpushed.bundle"] = file_sha256(path)
+        bundle = {"file": "unpushed.bundle", "ok": why is None, "error": why, "unpushed_commits": unp, "stashes": stash_n}
+
+    complete = not problems
     head = (git_ok(repo.path, "rev-parse", "HEAD") or "").strip() or None
     manifest = {
-        "repo": repo.path, "created": dt.datetime.now().isoformat(timespec="seconds"), "head": head,
+        "format": 2, "repo": repo.path, "created": dt.datetime.now().isoformat(timespec="seconds"), "head": head,
         "branch": (git_ok(repo.path, "symbolic-ref", "--quiet", "--short", "HEAD") or "").strip() or None,
-        "files": copied, "failed": failed, "deleted": deleted, "bytes": total, "bundle": bundle,
-        "stash_patches": stash_patches,
+        "complete": complete, "files": sorted(k[6:] for k in hashes if k.startswith("files/")),
+        "sha256": hashes,  # keyed by path inside this backup folder
+        "links": links, "failed": [p for p in problems if p["part"] == "file"], "problems": problems,
+        "deleted": deleted, "bytes": total, "bundle": bundle, "stash_patches": stash_patches,
         "restore": [
             "Files: copy files/ over the repository (or apply changes.patch with: git apply --binary changes.patch).",
             "Commits: git fetch <path>/unpushed.bundle '+refs/heads/*:refs/remotes/backup/*' then inspect backup/<branch>.",
             "Stashes: git apply --binary stash-N.patch (stash-0 is the newest).",
+            "Check: python repopulse.py verify --backup <path> re-hashes every file against this manifest.",
         ],
     }
-    (dest / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return {"ok": True, "backup": str(dest), "files": len(copied), "failed": failed, "deleted": len(deleted),
-            "bytes": total, "bundle": bundle, "stash_patches": len(stash_patches)}
+    write_json_atomic(dest / "manifest.json", manifest)
+    if complete:
+        marker.unlink()
+    log_operation(args.dest, {"op": "backup", "repo": repo.path, "backup": str(dest), "complete": complete,
+                              "problems": len(problems), "head": head})
+    summary = "; ".join(f"{p.get('path') or p['part']}: {p['error']}" for p in problems[:3])
+    return {"ok": complete, "complete": complete, "backup": str(dest), "files": len(manifest["files"]),
+            "failed": manifest["failed"], "problems": problems, "deleted": len(deleted), "links": len(links),
+            "bytes": total, "bundle": bundle, "stash_patches": len(stash_patches),
+            "error": None if complete else f"Backup is INCOMPLETE ({len(problems)} problem(s)): {summary}"}
+
+
+def cmd_verify(args) -> dict:
+    """Re-check a backup made by `backup`: every hashed file present and unchanged, bundle still valid."""
+    dest = Path(args.backup)
+    try:
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": f"No readable manifest.json in {dest}: {exc}"}
+    bad = []
+    for rel, digest in (manifest.get("sha256") or {}).items():
+        path = dest / rel
+        if not within(str(path), str(dest)):
+            bad.append({"path": rel, "error": "manifest entry points outside the backup"})
+            continue
+        try:
+            if file_sha256(path) != digest:
+                bad.append({"path": rel, "error": "content changed"})
+        except OSError as exc:
+            bad.append({"path": rel, "error": exc.strerror or str(exc)})
+    if (dest / "unpushed.bundle").exists() and manifest.get("repo") and os.path.isdir(manifest["repo"]):
+        why = bundle_holds(Repo(manifest["repo"]), dest / "unpushed.bundle", [])
+        if why:
+            bad.append({"path": "unpushed.bundle", "error": why})
+    complete = bool(manifest.get("complete", True)) and not (dest / "INCOMPLETE").exists()
+    return {"ok": not bad and complete, "complete": complete, "checked": len(manifest.get("sha256") or {}), "bad": bad,
+            "error": None if not bad and complete else
+            ("Backup was recorded as incomplete" if not bad else f"{len(bad)} file(s) failed verification")}
 
 
 def cmd_sync(args) -> dict:
@@ -1044,7 +1535,7 @@ def cmd_sync(args) -> dict:
         return {"ok": False, "state": "diverged", "ahead": ahead, "behind": behind,
                 "error": f"{d} has diverged ({ahead} ahead, {behind} behind). Repo Pulse does not merge or rebase."}
     if behind:
-        holder = next((t for t in repo.worktrees() if t.get("branch") == d and not t["bare"]), None)
+        holder = next((t for t in repo.worktrees() or [] if t.get("branch") == d and not t["bare"]), None)
         if holder:
             st = dirty_state(holder["path"])
             c = st["counts"]
@@ -1087,8 +1578,7 @@ def recycle(path: str) -> None:
         if os.path.exists(path):
             raise OSError("Recycle Bin did not remove the folder.")
     else:
-        trash = backup_root(os.environ.get("REPOPULSE_TRASH")) / "Trash" / stamp()
-        trash.mkdir(parents=True, exist_ok=True)
+        trash = unique_dir(backup_root(os.environ.get("REPOPULSE_TRASH")) / "Trash", f"{stamp()}-{path_tag(path)}")
         shutil.move(path, str(trash / safe_name(os.path.basename(path))))
 
 
@@ -1107,8 +1597,64 @@ def within(child: str, parent: str) -> bool:
     return c != p and os.path.commonpath([c, p]) == p
 
 
+LOCK_STALE_HOURS = 6
+
+
+def acquire_lock(repo: Repo) -> Path | None:
+    """One cleanup per repository at a time (two widget windows, or the CLI and the widget)."""
+    p = Path(repo.git_dir) / "repopulse.lock"
+    try:
+        if now() - p.stat().st_mtime > LOCK_STALE_HOURS * 3600:
+            p.unlink()  # left behind by a crash or forced termination
+    except OSError:
+        pass
+    try:
+        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return None
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps({"pid": os.getpid(), "at": now()}))
+    return p
+
+
+def revalidate(repo_path: str | None, seen: dict) -> dict | None:
+    """The item as it is right now, classified from scratch; None when it no longer exists.
+
+    Runs immediately before each action, so earlier actions in the same batch (a removed worktree frees
+    its branch, a deleted branch changes what is pushed) and other tools or agents are always accounted for.
+    """
+    kind = seen["kind"]
+    if kind == "cache":
+        return next((c for c in scan_caches() if c["id"] == seen["id"]), None)
+    repo = Repo(repo_path)
+    fresh = None
+    if kind in ("branch", "worktree"):
+        trees = repo.worktrees()
+        if trees is None:
+            raise RuntimeError("Could not list worktrees")
+        if kind == "branch":
+            got = classify_branches(repo, trees, only=seen["target"])
+            if got is None:
+                raise RuntimeError("Could not list branches")
+        else:
+            want = os.path.normcase(os.path.normpath(seen["target"]))
+            got = classify_worktrees(repo, [t for t in trees if os.path.normcase(os.path.normpath(t["path"])) == want], measure=False)
+        fresh = got[0] if got else None
+    elif kind == "folder":
+        fresh = classify_folder(repo.path, seen["target"], measure=False)
+    elif kind == "gc":
+        fresh = gc_item(repo)
+    if fresh is None:
+        return None
+    fresh["id"] = item_id(kind, repo.path, fresh["target"])
+    if fresh.get("bytes") is None or kind in ("folder", "worktree"):
+        fresh["bytes"] = seen.get("bytes") or 0  # sizes come from the scan; re-measuring would double the cost
+    return fresh if fresh["id"] == seen["id"] else None
+
+
 def cmd_clean(args) -> dict:
     ids = [i for i in (args.ids or "").split(",") if i]
+    review_ids = {i for i in (args.review_ids or "").split(",") if i}
     if not ids:
         return {"ok": False, "error": "No item ids given."}
     if args.repo:
@@ -1117,78 +1663,172 @@ def cmd_clean(args) -> dict:
             return {"ok": False, "error": fresh_scan["error"]}
         current = {i["id"]: i for i in fresh_scan["items"]}
         repo = Repo(args.repo)
+        lock = None if args.dry_run else acquire_lock(repo)
+        if lock is None and not args.dry_run:
+            return {"ok": False, "error": "Another Repo Pulse cleanup is running on this repository; try again when it ends."}
+        dest_parent = repo_backup_dir(args.dest, repo)
     else:
         current = {i["id"]: i for i in scan_caches()}
-        repo = None
-    dest = backup_root(args.dest) / (safe_name(repo.name) if repo else "_caches") / f"cleanup-{stamp()}"
+        repo, lock = None, None
+        dest_parent = backup_root(args.dest) / "_caches"
+    holder: dict[str, Path] = {}
+
+    def get_dest() -> Path:  # created on first use, never shared with another run
+        if "d" not in holder:
+            holder["d"] = unique_dir(dest_parent, f"cleanup-{stamp()}")
+        return holder["d"]
+
     results = []
-    for iid in ids:
-        it = current.get(iid)
-        if not it:
-            results.append({"id": iid, "done": False, "reason": "Changed since the scan; rescan first"})
-            continue
-        allowed = it["status"] == "safe" or (it["status"] == "review" and args.allow_review)
-        if not allowed:
-            results.append({"id": iid, "target": it["target"], "done": False, "reason": f"Status is {it['status']}: {it['reason']}"})
-            continue
-        try:
-            note = execute(repo, it, dest, args.permanent)
-            results.append({"id": iid, "target": it["target"], "kind": it["kind"], "done": True, "bytes": it["bytes"], "note": note})
-        except Exception as exc:
-            results.append({"id": iid, "target": it["target"], "kind": it["kind"], "done": False, "reason": str(exc)})
-    freed = sum(r.get("bytes", 0) for r in results if r["done"])
-    return {"ok": True, "results": results, "freed_bytes": freed, "backup": str(dest) if dest.exists() else None}
+    try:
+        for iid in ids:
+            seen = current.get(iid)
+            if not seen:
+                results.append({"id": iid, "done": False, "reason": "Changed since the scan; rescan first"})
+                continue
+            row = {"id": iid, "target": seen["target"], "kind": seen["kind"], "done": False}
+            try:
+                it = revalidate(args.repo, seen)
+            except Exception as exc:
+                results.append({**row, "reason": f"Could not re-check, kept: {exc}"})
+                continue
+            if it is None:
+                results.append({**row, "reason": "No longer exists or changed; rescan first"})
+                continue
+            row["status"] = it["status"]
+            # Review needs its own approval: an item selected as Safe that is Review now is never removed
+            approved = it["status"] == "safe" or (it["status"] == "review" and (iid in review_ids or args.allow_review))
+            if not approved:
+                hint = " (it was Safe when you selected it; select it again to approve it as Review)" \
+                    if it["status"] == "review" else ""
+                results.append({**row, "reason": f"Status is {it['status']}: {it['reason']}{hint}"})
+                continue
+            if args.dry_run:
+                results.append({**row, "would": True, "bytes": it["bytes"], "reason": it["reason"],
+                                "recovery": recovery_hint(it, args.permanent)})
+                continue
+            try:
+                out = execute(repo, it, get_dest, args.permanent)
+                results.append({**row, "done": True, "bytes": out.get("bytes", it["bytes"]), "note": out["note"],
+                                "recovery": out.get("recovery"), "irreversible": out.get("irreversible", False)})
+            except Exception as exc:
+                results.append({**row, "reason": str(exc)})
+            last = results[-1]
+            log_operation(args.dest, {"op": "clean", "repo": repo.path if repo else None, "kind": it["kind"],
+                                      "target": it["target"], "head": it.get("head"), "status": it["status"],
+                                      "done": last["done"], "bytes": last.get("bytes"),
+                                      "note": last.get("note") or last.get("reason"), "recovery": last.get("recovery")})
+    finally:
+        if lock:
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+    freed = sum(r.get("bytes") or 0 for r in results if r["done"])
+    would = sum(r.get("bytes") or 0 for r in results if r.get("would"))
+    out = {"ok": True, "results": results, "freed_bytes": freed, "backup": str(holder["d"]) if "d" in holder else None}
+    if args.dry_run:
+        out.update(dry_run=True, would_free_bytes=would)
+    return out
 
 
-def execute(repo: Repo | None, it: dict, dest: Path, permanent: bool) -> str:
+def recovery_hint(it: dict, permanent: bool) -> str:
     kind = it["kind"]
     if kind == "branch":
-        dest.mkdir(parents=True, exist_ok=True)
-        bundle = dest / f"branch-{safe_name(it['target'])}.bundle"
-        code, _, err = git(repo.path, "bundle", "create", str(bundle), f"refs/heads/{it['target']}", timeout=600)
+        return "Saved as a verified git bundle first; restore with git fetch <bundle> NAME:NAME"
+    if kind == "worktree":
+        return "Metadata only; nothing to restore" if it.get("action") == "prune" else \
+            "Branch and commits are kept; recreate with git worktree add. Ignored files are copied to the backup first"
+    if kind in ("folder", "cache"):
+        return "Permanent; rebuild or re-download it" if permanent else "Recycle Bin"
+    if kind == "gc":
+        return "Not reversible, but removes no reachable objects"
+    return ""
+
+
+def execute(repo: Repo | None, it: dict, get_dest, permanent: bool) -> dict:
+    kind = it["kind"]
+    if kind == "branch":
+        name, head = it["target"], it["head"]
+        if (git_ok(repo.path, "rev-parse", "--verify", "-q", f"refs/heads/{name}") or "").strip() != head:
+            raise RuntimeError("Branch changed since it was checked (another tool or agent moved it); kept")
+        tag = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]  # feature/x and feature_x must not share a file
+        bundle = unique_file(get_dest(), f"branch-{safe_name(name)}-{tag}", ".bundle")
+        code, _, err = git(repo.path, "bundle", "create", str(bundle), f"refs/heads/{name}", timeout=600)
         if code != 0:
             raise RuntimeError(f"Bundle failed, branch kept: {err}")
-        code, _, err = git(repo.path, "bundle", "verify", "--quiet", str(bundle), timeout=600)
+        why = bundle_holds(repo, bundle, [head])
+        if why:
+            raise RuntimeError(f"Bundle check failed, branch kept: {why}")
+        # compare-and-delete: refused when another tool or agent moved the branch after it was checked
+        code, _, err = git(repo.path, "update-ref", "-m", "repo-pulse: delete merged branch", "-d", f"refs/heads/{name}", head)
         if code != 0:
-            raise RuntimeError(f"Bundle did not verify, branch kept: {err}")
-        code, _, err = git(repo.path, "branch", "-D", it["target"])
-        if code != 0:
-            raise RuntimeError(err)
-        return f"Saved to {bundle.name}; restore with: git fetch \"{bundle}\" {it['target']}:{it['target']}"
+            raise RuntimeError(f"Branch changed since it was checked, kept (bundle saved anyway): {err}")
+        git(repo.path, "config", "--remove-section", f"branch.{name}")  # upstream settings; absent is fine
+        restore = f"git fetch \"{bundle}\" {name}:{name}"
+        return {"note": f"Saved to {bundle.name}; restore with: {restore}", "recovery": restore}
     if kind == "worktree":
         if it.get("action") == "prune":
-            code, _, err = git(repo.path, "worktree", "prune")
-            if code != 0:
-                raise RuntimeError(err)
-            return "Pruned stale worktree metadata"
+            admin = worktree_admin_dir(repo, it["target"])
+            if admin is None:
+                raise RuntimeError("Worktree metadata not found; it may already be pruned")
+            if os.path.exists(os.path.join(it["target"], ".git")):
+                raise RuntimeError("The worktree folder is back; kept")
+            if os.path.exists(os.path.join(admin, "locked")):
+                raise RuntimeError("Worktree is locked; kept")
+            remove_permanently(admin)  # this entry only; `git worktree prune` would touch every stale entry
+            return {"note": "Pruned stale worktree metadata", "irreversible": True}
+        saved = None
+        if it.get("precious"):
+            sub = unique_dir(get_dest(), f"worktree-{safe_name(os.path.basename(it['target']))}-{path_tag(it['target'])}")
+            hashes, links = {}, []
+            for rel in it["precious"]:
+                h, problems = copy_tree_verified(it["target"], rel, sub / "ignored")
+                hashes.update(h)
+                errors = [p for p in problems if not p.get("link")]
+                links += [p["path"] for p in problems if p.get("link")]
+                if errors:
+                    raise RuntimeError(f"Could not back up ignored file {errors[0]['path']} ({errors[0]['error']}); worktree kept")
+            write_json_atomic(sub / "manifest.json", {"worktree": it["target"], "branch": it.get("branch"), "head": it.get("head"),
+                                                      "sha256": hashes, "links_not_followed": links,
+                                                      "restore": "Copy ignored/ back into a new worktree of the same branch."})
+            saved = sub
         code, _, err = git(repo.path, "worktree", "remove", it["target"], timeout=600)  # no --force: git refuses dirty trees
         if code != 0:
             raise RuntimeError(err)
-        return "Worktree removed (its branch is kept)"
+        note = "Worktree removed (its branch is kept)" + (f"; ignored files saved to {saved}" if saved else "")
+        return {"note": note, "recovery": f"git worktree add \"{it['target']}\" {it.get('branch') or it.get('head')}"}
     if kind == "folder":
         full = os.path.join(repo.path, it["target"])
-        if not within(full, repo.path):
-            raise RuntimeError("Path resolves outside the repository; skipped")
+        if not within(full, repo.path) or os.path.islink(full) or is_junction(full):
+            raise RuntimeError("Path is a link or resolves outside the repository; skipped")
         if has_tracked(repo.path, it["target"]):
             raise RuntimeError("Contains tracked files; skipped")
         if permanent:
             if it["status"] != "safe":
                 raise RuntimeError("Permanent delete is only allowed for Safe rebuildable folders")
             remove_permanently(full)
-            return "Deleted permanently (rebuildable)"
+            return {"note": "Deleted permanently (rebuildable)", "irreversible": True}
         recycle(full)
-        return "Moved to Recycle Bin"
+        return {"note": "Moved to Recycle Bin", "recovery": "Restore it from the Recycle Bin"}
     if kind == "cache":
+        if os.path.islink(it["target"]) or is_junction(it["target"]):
+            raise RuntimeError("Cache folder is a link; skipped")
         if permanent and it["status"] == "safe":
             remove_permanently(it["target"])
-            return "Deleted permanently (re-downloadable)"
+            return {"note": "Deleted permanently (re-downloadable)", "irreversible": True}
         recycle(it["target"])
-        return "Moved to Recycle Bin"
+        return {"note": "Moved to Recycle Bin", "recovery": "Restore it from the Recycle Bin"}
     if kind == "gc":
+        busy = repo.busy()
+        if busy:
+            raise RuntimeError("A git operation started meanwhile: " + ", ".join(busy[:3]))
+        before = dir_size(repo.git_dir)
         code, _, err = git(repo.path, "gc", "--quiet", timeout=1800)
+        after = dir_size(repo.git_dir)
         if code != 0:
-            raise RuntimeError(err)
-        return "git gc completed"
+            raise RuntimeError(f"git gc failed (the repository is unchanged or only partly packed; git keeps it consistent): {err}")
+        freed = max(0, before - after)
+        return {"note": f"git gc freed {human(freed)} (estimated up to {human(it['bytes'])})", "bytes": freed, "irreversible": True}
     raise RuntimeError(f"Unknown item kind {kind}")
 
 
@@ -1259,9 +1899,13 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("clean", help="Remove scanned items after re-verification")
     c.add_argument("--repo")
     c.add_argument("--ids", required=True)
-    c.add_argument("--allow-review", action="store_true")
+    c.add_argument("--review-ids", help="Comma-separated ids the user approved although they are Review")
+    c.add_argument("--allow-review", action="store_true", help="Approve every listed id even if it is Review")
     c.add_argument("--permanent", action="store_true", help="Delete Safe rebuildable folders instead of recycling")
+    c.add_argument("--dry-run", action="store_true", help="Re-check and report what would happen; change nothing")
     c.add_argument("--dest")
+    v = sub.add_parser("verify", help="Re-check a backup against its manifest")
+    v.add_argument("--backup", required=True)
     f = sub.add_parser("diff", help="Diff text for one file")
     f.add_argument("--repo", required=True)
     f.add_argument("--path", required=True)
@@ -1270,7 +1914,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    handlers = {"scan": cmd_scan, "backup": cmd_backup, "sync": cmd_sync, "clean": cmd_clean, "diff": cmd_diff}
+    handlers = {"scan": cmd_scan, "backup": cmd_backup, "sync": cmd_sync, "clean": cmd_clean, "diff": cmd_diff,
+                "verify": cmd_verify}
     try:
         result = handlers[args.cmd](args)
     except Exception as exc:

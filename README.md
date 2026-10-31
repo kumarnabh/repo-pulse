@@ -47,12 +47,21 @@ folders to skip. Hover the summary line to see which folders were searched and h
 | git gc | Over 50 MB of loose or garbage objects (normal prune window) |
 
 Everything else is **Review** (needs your explicit selection) or **kept** and never offered.
-Every item is re-checked immediately before removal. Branches are saved as git bundles first;
-folders go to the Recycle Bin. Restore a branch with:
+A worktree an agent or editor touched in the last 30 minutes, a branch being rebased and long-lived
+branches (`develop`, `release/*`, …) are never Safe.
+Every item is re-checked from scratch immediately before its own removal, and anything that changed
+(including an item that turned from Safe to Review) is skipped. Branches are saved as verified git
+bundles first and deleted only if nobody moved them meanwhile; a worktree's ignored files (`.env`,
+local config) are copied out first; folders go to the Recycle Bin. Restore a branch with:
 
 ```
-git fetch "<backup>\branch-NAME.bundle" NAME:NAME
+git fetch "<backup>\branch-NAME-HASH.bundle" NAME:NAME
 ```
+
+Backups are hash-checked and test-restored before they are reported as done. A backup that is
+missing anything says **INCOMPLETE** and lists what. Re-check an old one with
+`python repopulse.py verify --backup "<folder>"`. Every backup and cleanup is logged, with its
+recovery command, in `RepoPulse Backups\operations.jsonl`.
 
 ## Command line
 
@@ -65,6 +74,8 @@ python repopulse.py scan --roots ~/code --no-hints  # JSON, only this folder
 python repopulse.py backup --repo "D:\Code\app"
 python repopulse.py sync   --repo "D:\Code\app" [--push]
 python repopulse.py clean  --repo "D:\Code\app" --ids ID1,ID2   # ids are shown by scan --text
+python repopulse.py clean  --repo "D:\Code\app" --ids ID1,ID2 --review-ids ID2 --dry-run
+python repopulse.py verify --backup "%USERPROFILE%\RepoPulse Backups\app-1a2b3c4d\20261031-120000"
 ```
 
 Every command except `--text` prints one JSON object (see [SPEC.md](SPEC.md) for the fields).
