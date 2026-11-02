@@ -1,7 +1,67 @@
 # Changelog
 
+## Unreleased
+
+- Honor linked-worktree and descendant exclusions in scans and cleanup candidates;
+  preserve and restore history reachable only from a detached HEAD in backups.
+- Versioned read-only snapshot CLI/Python API for Aura, JSON Schema and example adapter.
+- Stable checkout/shared-repository IDs, complete remote/branch/worktree facts,
+  explicit partial results, risk findings and resume/sync/cleanup readiness.
+- Bounded-age incremental disk estimates with live Git reclassification,
+  overlapping-size deduplication and agent worktree orphan candidates.
+- Correct unusual worktree paths, linked-only discovery, broken-root identity,
+  failed/multiple-remote fetch freshness and conservative sync error handling.
+- Contract and adversarial fixture regressions; existing backup, restore, undo
+  and explicit cleanup mechanisms retained.
+
 All notable changes. Versions follow [semantic versioning](https://semver.org/); releases are on
 [GitHub](https://github.com/kumarnabh/repo-pulse/releases).
+
+## 0.5.0 — unreleased
+
+Safety, backup and recovery reliability.
+
+### Safety fixes
+- **Review items need their own approval.** The widget used to pass `--allow-review` for a whole repository whenever one selected item was Review, so an item selected as Safe that turned Review before cleanup (for example, the fetch went stale) was removed anyway. Review items are now approved one by one (`--review-ids`).
+- **Every item is re-checked right before its own action**, not once per batch, so earlier removals in the same batch and other tools are accounted for. Only one cleanup runs per repository at a time.
+- **Compare-and-delete for branches.** A branch is deleted only if it still points at the commit that was checked and bundled; if a coding agent commits to it meanwhile, it is kept.
+- **Ignored files are saved before a worktree is removed.** `.env`, local config and data files in a Review worktree are copied out and hash-verified first; if a copy fails, the worktree is kept.
+- **Worktrees in use are kept.** A worktree with files changed in the last 30 minutes, or with a merge, rebase or index lock in progress, is never offered.
+- **Stale worktree metadata is pruned one entry at a time.** `git worktree prune` removed every stale entry, including ones not selected. A stale detached worktree whose HEAD is the only reference to some commits is now kept.
+- Branches being rebased, and long-lived names (`develop`, `release/*`, `staging`, …), are never Safe. Safe branches now say whether they are merged into the default branch or only pushed.
+- `git gc` is held while another git operation is running, and reports the space it actually freed instead of the estimate.
+- Links and junctions are never followed by backup, folder or cache cleanup.
+
+### Backup fixes
+- **Backups never overwrite each other.** Two repositories with the same name shared one backup folder, two backups in the same second collided, and branches such as `feat/x` and `feat_x` overwrote each other's bundle. Folders and bundles now have unique names.
+- **No false success.** A backup that misses a file, a patch, a stash or the bundle now reports `INCOMPLETE` (and the widget says so) instead of success.
+- **Backups are proven restorable.** Every file copy is hash-checked against its source (and refused if the source changed meanwhile), every patch is test-applied in a throwaway index, and the bundle must verify. Free space is checked first. New `verify` command re-checks an old backup.
+- Every backup and cleanup is recorded in `operations.jsonl` with its recovery command.
+
+### Bug fixes
+- A failed fetch no longer counts as fresh because git rewrote `FETCH_HEAD`.
+- Repositories whose default branch is `trunk`, `develop` or `init.defaultBranch` are recognised.
+- Failed git reads (status, branches, worktrees, stashes, comparisons) show as errors and `health: unknown` instead of a healthy-looking repository.
+- New untracked folders list each file, so counts, diffs and backups see real files.
+- Every existing global cache location is found, not only the first.
+- New `clean --dry-run` reports what would be removed, the space and how to recover it, without changing anything.
+- Git for Windows silently skipped paths over 260 characters, so a backup could miss them and still report success. Every git call now enables `core.longpaths` on Windows.
+
+### Recovery
+- **`restore`** puts a backup back: files (a file with uncommitted changes that differ from the backup is never overwritten without `--overwrite`, and then your version is saved first), branches (missing ones are recreated; an existing branch is never moved, the backed-up tip is kept at `refs/repopulse-backup/…`), and every stash, rebuilt as real stash entries even in a fresh clone. `restore --bundle` brings back a branch removed by cleanup; `restore --backup <worktree-…>` puts saved ignored files back.
+- **`undo --op ID`** reverses a cleanup: deleted branches, removed worktrees (with their ignored files) and folders moved to the Recycle Bin. Irreversible actions (`git gc`, pruned metadata, permanent deletes) are marked as such and refused.
+- **Operation journal.** Every cleanup writes a `started` line before it changes anything and a `finished` line after, with the previous ref, outcome, freed space and recovery data. `ops` lists them; **`recover`** finds operations cut short by a crash or power loss, says what to check, and with `--fix` removes stale locks left by dead processes.
+- **`backups`** lists every backup and cleanup folder with completeness, encryption, size, age and restore command; `--verify` re-hashes them; `--prune-days N [--apply]` is a retention policy that keeps the newest per repository and moves the rest to the Recycle Bin.
+- **Encrypted backups** (`backup --encrypt`, `clean --encrypt`): copied files, patches and saved ignored files are encrypted with Windows DPAPI for the current Windows account, and each one is decrypted again to prove it.
+- Backup manifests now record each stash's base commit and message. The old restore hint (fetching into `refs/remotes/backup/*`) is replaced: refs under `refs/remotes` would make unpushed work look pushed.
+
+### Repository layouts
+- Shallow clones, partial clones, sparse checkout, Git LFS and submodules are detected (`features`). Branches of a shallow clone are never Safe; worktrees with initialized submodules are kept; a backup of an LFS repository with unpushed commits says the LFS contents are not in the bundle.
+- **Remote health**: branches tracking a remote that does not exist, remotes without a URL, local remotes whose folder is gone, and an unset `origin/HEAD` are reported.
+- A detached HEAD with commits on no branch is flagged so they are not lost.
+
+### Runtime
+- Python 3.11 or newer is required (3.10 reached end of life in October 2026).
 
 ## 0.4.0 — 2026-10-11
 

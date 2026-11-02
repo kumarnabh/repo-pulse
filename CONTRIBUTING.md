@@ -15,14 +15,18 @@ Please do not paste private paths or file contents you would not want public.
 
 ## Changing the code
 
-- `repopulse.py` is standard library only and must keep running on Python 3.10.
+- `repopulse.py` is standard library only and must keep running on Python 3.11.
 - Every change to classification or cleanup needs a fixture test in `tests/test_repopulse.py` that
   builds the situation with real git commands and proves no false Safe.
 - Run the tests before opening a pull request:
 
   ```
+  python -m pip install -r requirements-dev.txt
   python -m unittest discover -s tests -v
   ```
+
+  The core remains standard-library only. `requirements-dev.txt` is solely for
+  validating the versioned integration JSON Schema in the fixture tests.
 
 - The widget (`source/`) is code-only WPF on .NET 10. `Build.cmd` builds it; keep it free of warnings.
 

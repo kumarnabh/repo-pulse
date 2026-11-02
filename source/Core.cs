@@ -54,7 +54,7 @@ public static class Core
                 var psi = new ProcessStartInfo(file) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
                 foreach (var p in prefix) psi.ArgumentList.Add(p);
                 psi.ArgumentList.Add("-c");
-                psi.ArgumentList.Add("import sys; print(sys.version_info >= (3, 10))");
+                psi.ArgumentList.Add("import sys; print(sys.version_info >= (3, 11))");
                 using var proc = Process.Start(psi);
                 if (proc == null) continue;
                 var output = proc.StandardOutput.ReadToEndAsync();  // read async so a hung interpreter cannot block past the timeout
@@ -64,7 +64,7 @@ public static class Core
             }
             catch { }
         }
-        throw new InvalidOperationException("Python 3.10 or newer was not found. Install it from python.org with the Python launcher, then restart Repo Pulse.");
+        throw new InvalidOperationException("Python 3.11 or newer was not found. Install it from python.org with the Python launcher, then restart Repo Pulse.");
     }
 
     public static async Task<JsonElement> Run(TimeSpan timeout, params string[] args)

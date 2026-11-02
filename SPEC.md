@@ -26,15 +26,50 @@ automatic cleanup, anything requiring administrator rights.
 Core commands:
 
 ```
+repopulse.py snapshot --root PATH [--repo PATH] [--no-hints] [--json | --text] [--previous FILE] [--max-size-age SECONDS] [--workers N]
 repopulse.py scan    --roots "D:\Code;C:\Users\me\source" [--exclude "D:\Code\old"] [--fetch] [--caches] [--no-hints] [--text]
 repopulse.py backup  --repo PATH [--dest DIR]
 repopulse.py sync    --repo PATH [--push]
-repopulse.py clean   --repo PATH --ids ID1,ID2 [--allow-review] [--dest DIR]
+repopulse.py clean   --repo PATH --ids ID1,ID2 [--review-ids ID2] [--allow-review] [--dry-run] [--permanent] [--dest DIR]
+repopulse.py verify  --backup DIR
+repopulse.py restore --backup DIR [--repo PATH] [--parts files,commits,stashes] [--overwrite] [--dry-run]
+repopulse.py restore --bundle FILE --repo PATH
+repopulse.py undo    --op OP_ID
+repopulse.py ops     [--limit N]
+repopulse.py recover [--fix]
+repopulse.py backups [--verify] [--prune-days N [--apply]]
 ```
 
+`scan` and `snapshot` share the additive [v1 JSON Schema](docs/snapshot.schema.json).
+The [Aura integration contract](docs/AURA.md) specifies identity, partial results,
+readiness, risk, incremental size estimates, and exit codes. `snapshot` accepts no
+mutation options. The Python `repopulse.snapshot(...)` API is also read-only.
+
+`restore` never moves an existing branch and never overwrites a file with uncommitted changes unless
+`--overwrite` is given (the current version is first saved to `pre-restore-<time>/` in the backup).
+Restored branch tips that clash with an existing branch are kept at `refs/repopulse-backup/<time>/<name>`,
+outside `refs/remotes`, so they never make local work look pushed. Stashes are rebuilt as real stash
+entries from their patch and recorded base commit when the original objects are gone.
+`undo` reverses one journaled cleanup (branch, worktree with its ignored files, recycled folder); `git gc`,
+pruned metadata and permanent deletes are irreversible and say so. `recover` lists cleanups that wrote a
+`started` journal line but no `finished` line (crash, power loss, forced termination) with advice, plus
+incomplete backups and stale locks.
+
+`clean --review-ids` names the Review items the user approved one by one; every other id must still
+be Safe when it is re-checked. `--allow-review` approves every listed id (command-line use only).
+`--dry-run` re-checks the items and reports what would happen, the space and the recovery path,
+without changing anything. `verify` re-hashes a backup against its manifest and re-verifies its bundle.
+
+Files Repo Pulse writes outside its backup folder: `<git dir>/repopulse-fetch.json` (time of the last
+successful and failed fetch per remote, written by `--fetch` and `sync`) and `<git dir>/repopulse.lock`
+(held while a cleanup runs; ignored after 6 hours). Every backup and cleanup outcome is appended to
+`<backup folder>/operations.jsonl`, with the recovery command where there is one.
+
 `scan` never changes anything, except `--fetch`, which runs
-`git fetch --prune --no-tags origin` on every main repository before scanning (it updates only
+`git fetch --prune --no-tags <preferred remote>` on every main repository before scanning (it updates only
 remote-tracking refs; repositories without a remote are skipped, not reported as failures).
+The preferred remote is `origin`, else the first configured remote. Fetch freshness
+is per remote; shared FETCH_HEAD is a fallback only for a single-remote repository.
 `--no-hints` skips tool-history discovery. `--exclude` lists folders that are never walked or reported.
 `--text` prints a readable report instead of JSON.
 
@@ -59,31 +94,46 @@ remote-tracking refs; repositories without a remote are skipped, not reported as
 | `dirty` | staged, modified, untracked, conflicted counts; `diff` = per-file +/− lines |
 | `unpushed_branches` | local branches whose commits exist on no remote |
 | `stashes` | stash count (stashes are never touched by cleanup) |
-| `fetched_age_h` | hours since the last fetch; status is stale beyond 24 h |
+| `fetched_age_h` | hours since the last fetch known to have succeeded; status is stale beyond 24 h |
+| `errors` / `health` | git reads that failed (status, branches, worktrees, stashes, comparisons); `health` is `unknown` when any did |
+
+The default branch is the remote's `HEAD`, else `init.defaultBranch`, else the first of `main`,
+`master`, `trunk`, `develop` that exists. A fetch that Repo Pulse saw fail does not count as fresh
+even though git rewrote `FETCH_HEAD`, until a later fetch succeeds.
 
 ## Safety classification
 
-Every cleanup item is **Safe**, **Review** or **Keep**. Only Safe items can be
-removed without `--allow-review`. Classification is recomputed immediately
-before execution; if an item changed since the scan, it is skipped.
+Every cleanup item is **Safe**, **Review** or **Keep**. Safe items run when selected; a Review item
+runs only when its own id is approved (`--review-ids`). Immediately before **each** action the item
+is classified again from scratch, so earlier actions in the same batch and other tools or agents are
+accounted for: an item that no longer exists, changed identity, or turned from Safe to Review is
+skipped. Only one cleanup runs per repository at a time.
 
 ### Branches
-- **Keep**: the default branch; any branch checked out in any worktree; any branch
-  with commits not contained in a remote-tracking ref.
-- **Safe**: the tip is contained in `origin/<default>` or in its own upstream,
-  **and** the last fetch is under 24 hours old.
-- **Review**: contained in a remote but the fetch is stale; or the upstream is gone
-  and the commits are not on any remote (typical after a squash merge).
-- Before deletion, every branch is written to a `git bundle` in the backup
-  folder, so it can be restored with `git fetch <bundle> <branch>:<branch>`.
+- **Keep**: the default branch; any branch checked out in any worktree; a branch being rebased;
+  any branch with commits not contained in a remote-tracking ref.
+- **Safe**: every commit is on a remote **and** the last fetch is under 24 hours old. The reason
+  says whether the branch is merged into `origin/<default>` (`merged: true`) or only pushed.
+- **Review**: contained in a remote but the fetch is stale; long-lived names (`develop`, `release/*`,
+  `staging`, `production`, `hotfix/*`, …); or the upstream is gone and the commits are not on any
+  remote (typical after a squash merge).
+- Before deletion, every branch is written to a git bundle with a unique name
+  (`branch-<name>-<hash>.bundle`), which must verify and carry the exact tip that was checked.
+  Deletion is compare-and-delete (`git update-ref -d <ref> <checked tip>`): if another tool or agent
+  moved the branch meanwhile, it is kept. Restore with `git fetch <bundle> <branch>:<branch>`.
 
 ### Worktrees
-- **Safe**: the directory is already missing (prunable metadata) → `git worktree prune`.
-- **Safe**: clean, not locked, its HEAD is contained in a remote, with a fresh fetch, and it holds
-  no ignored files other than rebuildable folders from the folder rules below.
-- **Review**: as Safe, but it holds other ignored files (`.env`, local config, data). `git worktree
-  remove` deletes ignored files without asking, and these exist nowhere else.
-- **Keep**: dirty, locked, the main worktree, or HEAD has unpushed commits.
+- **Safe**: the directory is already missing (prunable metadata), unless its detached HEAD is the
+  only reference to some commits (then **Keep**). Only that one metadata entry is removed; other
+  stale entries are left alone, unlike `git worktree prune`.
+- **Safe**: clean, not locked, its HEAD is contained in a remote, with a fresh fetch, no git
+  operation in progress, no file changed in the last 30 minutes, and it holds no ignored files other
+  than rebuildable folders from the folder rules below.
+- **Review**: as Safe, but it holds other ignored files (`.env`, local config, data). These are copied
+  to the cleanup folder and hash-verified first; if any copy fails, the worktree is kept.
+- **Keep**: dirty, locked, the main worktree, HEAD has unpushed commits, a merge/rebase/lock is in
+  progress, or files changed in the last 30 minutes (a coding agent or editor may be using it;
+  `REPOPULSE_ACTIVE_MINUTES` changes the window, 0 turns it off).
 - Removal uses `git worktree remove` without `--force`, so git itself refuses
   dirty trees as a second guard.
 
@@ -100,19 +150,28 @@ before execution; if an item changed since the scan, it is skipped.
 
 ### Git garbage
 - `git gc` (default prune window, never `--prune=now`) is Safe when loose or
-  garbage objects exceed 50 MB.
+  garbage objects exceed 50 MB; **Keep** while a merge, rebase, bisect, lock or another gc is in
+  progress. The scan size is an upper estimate; the result reports the space actually freed.
 
 ## Backup
 
-Writes to `%USERPROFILE%\RepoPulse Backups\<repo>\<timestamp>\`:
-- every modified, staged and untracked (non-ignored) file, at its relative path;
+Writes to `%USERPROFILE%\RepoPulse Backups\<repo>-<path hash>\<timestamp>[-N]\` (two repositories
+with the same name, or two backups in the same second, never share a folder):
+- every modified, staged and untracked (non-ignored) file, at its relative path, each copy
+  hash-checked against the source and refused if the source changed while it was read;
 - `changes.patch` (`git diff HEAD --binary`) and `staged.patch`;
 - `unpushed.bundle` containing commits on no remote and the newest stash (skipped when there are none);
+- detached HEAD commits are included in that bundle even when no local branch
+  reaches them; restore gives them a `recovered-detached-<tip>` branch without
+  moving the current checkout or an existing branch;
 - `stash-N.patch` for every stash entry (`stash-0` is the newest), including untracked files on git 2.32+;
-- `manifest.json` with branch, HEAD, file list, files that could not be copied, and restore instructions.
+- `manifest.json` with branch, HEAD, file list, SHA-256 of every saved file, symlinks (recorded, never
+  followed), problems, and restore instructions.
 
-A file that cannot be read (for example locked by another program) is listed in `failed`; the rest
-of the backup continues.
+Before writing, free space is checked. After writing, every patch is test-applied to its base commit
+in a throwaway index, and the bundle must verify and carry the stash tip. Any problem (a locked file,
+a failed patch or bundle, a git read that failed) makes the result `ok: false, complete: false` with
+the problems listed; what was saved stays on disk and an `INCOMPLETE` file marks the folder.
 
 The working tree is not modified.
 
@@ -122,7 +181,8 @@ The working tree is not modified.
   in a clean worktree, `git merge --ff-only`; if not checked out, `git fetch . origin/main:main`.
   Git refuses non-fast-forward updates in both paths.
 - `--push`: `git push origin <branch>` without force, only when ahead and not behind.
-- Diverged or dirty: no action; the UI shows the diff and the counts.
+- Diverged, unreadable comparison/status, locked holder or an interrupted Git/Repo
+  Pulse operation: no action; inspect the reported reason before retrying.
 
 ## Repository discovery
 

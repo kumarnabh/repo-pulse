@@ -366,6 +366,14 @@ public sealed class MainWindow : Window
                    (fetched == null ? "never fetched" : $"fetched {(fetched < 1 ? "<1 h" : $"{fetched:0} h")} ago");
         body.Children.Add(T(meta, 11, Dim));
         body.Children.Add(T(path, 11, Dim));
+        if (r.Has("readiness"))
+        {
+            var ready = r.O("readiness");
+            body.Children.Add(T($"Resume: {ready.O("resume").S("state")} · Sync: {ready.O("sync").S("state")} · " +
+                                $"Clean candidates: {ready.O("clean").S("state")} · Risk: {r.O("risk").S("level")}", 11, Dim, wrap: true));
+            foreach (var finding in r.O("risk").A("findings"))
+                body.Children.Add(T(finding.S("guidance"), 11, Dim, wrap: true));
+        }
         foreach (var note in r.EnumerateNotes())
             body.Children.Add(T("• " + note, 12, Br("#F5C86B"), wrap: true));
 
@@ -536,7 +544,9 @@ public sealed class MainWindow : Window
         {
             var args = new List<string> { "clean", "--ids", string.Join(",", group.Select(g => g.Item.S("id"))) };
             if (group.Key != "") { args.Add("--repo"); args.Add(group.Key); }
-            if (group.Any(g => g.Item.S("status") == "review")) args.Add("--allow-review");
+            // approve Review items one by one: an item selected as Safe that turns Review before cleanup is skipped
+            var reviewIds = group.Where(g => g.Item.S("status") == "review").Select(g => g.Item.S("id")).ToList();
+            if (reviewIds.Count > 0) { args.Add("--review-ids"); args.Add(string.Join(",", reviewIds)); }
             var res = await Act($"Cleaning {Path.GetFileName(group.Key.TrimEnd('\\', '/'))}…", WithDest(args.ToArray()));
             if (res is not { } result) { failures.Add($"{group.Key}: core did not finish"); break; }  // still rescan below
             if (!result.B("ok")) { failures.Add(result.S("error")); continue; }
@@ -577,8 +587,18 @@ public sealed class MainWindow : Window
     {
         var res = await Act($"Backing up {r.S("name")}…", WithDest("backup", "--repo", r.S("path")));
         if (res is not { } result) return;
-        if (!result.B("ok")) { MessageBox.Show(result.S("error"), "Backup not made", MessageBoxButton.OK, MessageBoxImage.Warning); Say("Backup not made."); return; }
         var dest = result.S("backup");
+        if (!result.B("ok") && string.IsNullOrEmpty(dest)) { MessageBox.Show(result.S("error"), "Backup not made", MessageBoxButton.OK, MessageBoxImage.Warning); Say("Backup not made."); return; }
+        if (!result.B("ok"))
+        {
+            var problems = result.A("problems").Take(5).Select(p => $"• {p.S("path", p.S("part"))}: {p.S("error")}");
+            Say($"Backup of {r.S("name")} is INCOMPLETE.");
+            if (MessageBox.Show($"The backup is INCOMPLETE. Do not rely on it until these are fixed:\n\n{string.Join("\n", problems)}\n\n" +
+                                $"What was saved is in:\n{dest}\n\nOpen the folder?", "Repo Pulse — backup incomplete",
+                                MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes)
+                OpenFolder(dest);
+            return;
+        }
         var bundle = result.O("bundle");
         var failed = result.A("failed").ToList();
         var detail = $"{result.N("files")} file(s), {J.Human(result.N("bytes"))}" +

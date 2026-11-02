@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/kumarnabh/repo-pulse/blob/main/docs/snapshot.schema.json",
+  "title": "Repo Pulse snapshot v1",
+  "type": "object",
+  "required": ["ok", "schema_version", "complete"],
+  "properties": {
+    "ok": {"type": "boolean"},
+    "schema_version": {"const": "1.0"},
+    "complete": {"type": "boolean"},
+    "error": {"type": "string"},
+    "producer": {"const": "repo-pulse"},
+    "version": {"type": "string"},
+    "read_only": {"type": "boolean"},
+    "scanned_at": {"type": "integer"},
+    "scan_ms": {"type": "integer", "minimum": 0},
+    "roots": {"type": "array", "items": {"type": "string"}},
+    "repos": {"type": "array", "items": {"$ref": "#/$defs/checkout"}},
+    "caches": {"type": "array", "items": {"$ref": "#/$defs/item"}},
+    "diagnostics": {"type": "array", "items": {"type": "object", "required": ["path", "code", "message"]}},
+    "recovery": {"type": "object", "required": ["interrupted", "incomplete_backups", "locks", "clean"]},
+    "refresh": {"type": "object", "required": ["git", "size_max_age_seconds", "reused_measurements"],
+      "properties": {"git": {"const": "live"}, "size_max_age_seconds": {"type": "integer", "minimum": 0, "maximum": 3600}, "reused_measurements": {"type": "integer", "minimum": 0}}},
+    "totals": {"type": "object", "required": ["repos", "worktrees", "needs_attention", "safe_bytes", "review_bytes", "worktree_bytes", "git_bytes"],
+      "additionalProperties": {"type": "integer", "minimum": 0}}
+  },
+  "if": {"properties": {"ok": {"const": true}}},
+  "then": {"required": ["producer", "version", "read_only", "scanned_at", "scan_ms", "roots", "repos", "caches", "diagnostics", "recovery", "refresh", "totals"]},
+  "else": {"required": ["error"], "properties": {"complete": {"const": false}}},
+  "$defs": {
+    "state": {"enum": ["safe", "review", "blocked", "unknown"]},
+    "decision": {"type": "object", "required": ["state", "reason"],
+      "properties": {"state": {"$ref": "#/$defs/state"}, "reason": {"type": "string"}}},
+    "item": {"type": "object", "required": ["id", "kind", "target", "status", "reason", "bytes"],
+      "properties": {
+        "id": {"type": "string"}, "kind": {"enum": ["branch", "worktree", "folder", "gc", "cache"]},
+        "target": {"type": "string"}, "status": {"enum": ["safe", "review", "keep"]},
+        "reason": {"type": "string"}, "bytes": {"type": ["integer", "null"], "minimum": 0}, "recovery": {"type": "string"}
+      }},
+    "remote": {"type": "object", "required": ["name", "fetch_urls", "push_urls", "last_success_at", "last_failure_at", "fresh", "contact"],
+      "properties": {
+        "name": {"type": "string"}, "fetch_urls": {"type": "array", "items": {"type": "string"}},
+        "push_urls": {"type": "array", "items": {"type": "string"}},
+        "last_success_at": {"type": ["number", "null"]}, "last_failure_at": {"type": ["number", "null"]},
+        "fresh": {"type": "boolean"}, "contact": {"enum": ["failed", "not_checked"]}
+      }},
+    "worktree": {"type": "object", "required": ["path", "head", "branch", "main", "bare", "locked", "lock_reason", "prunable", "prune_reason", "exists", "agent_origin", "orphan_status", "stale", "cleanup_status", "reason", "bytes"],
+      "properties": {
+        "path": {"type": "string"}, "head": {"type": ["string", "null"]}, "branch": {"type": ["string", "null"]},
+        "main": {"type": "boolean"}, "bare": {"type": "boolean"}, "locked": {"type": "boolean"}, "exists": {"type": "boolean"},
+        "stale": {"type": "boolean"}, "agent_origin": {"enum": ["codex", "claude", null]},
+        "orphan_status": {"enum": ["missing", "candidate", "not_proven"]},
+        "cleanup_status": {"enum": ["safe", "review", "keep"]}, "reason": {"type": "string"}, "bytes": {"type": ["integer", "null"]}
+      }},
+    "checkout": {
+      "type": "object",
+      "required": ["id", "repository_id", "path", "name", "kind", "source", "observed_at", "risk", "readiness"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^checkout-[0-9a-f]{24}$"},
+        "repository_id": {"type": ["string", "null"]},
+        "path": {"type": "string"}, "name": {"type": "string"}, "kind": {"enum": ["repo", "worktree"]},
+        "source": {"type": "string"}, "observed_at": {"type": "integer"}, "error": {"type": "string"},
+        "branch": {"type": ["string", "null"]}, "head": {"type": ["string", "null"]},
+        "health": {"enum": ["ok", "unknown"]}, "errors": {"type": "array", "items": {"type": "string"}},
+        "branches": {"type": "array", "items": {"$ref": "#/$defs/item"}},
+        "items": {"type": "array", "items": {"$ref": "#/$defs/item"}},
+        "remotes": {"type": "array", "items": {"$ref": "#/$defs/remote"}},
+        "worktree_inventory": {"type": "array", "items": {"$ref": "#/$defs/worktree"}},
+        "dirty": {"type": "object", "required": ["total", "staged", "modified", "untracked", "conflicted", "files", "truncated"]},
+        "risk": {"type": "object", "required": ["level", "findings"],
+          "properties": {"level": {"enum": ["healthy", "protected", "review", "blocked", "unknown"]}, "findings": {"type": "array", "items": {"type": "object", "required": ["code", "level", "reason", "guidance"]}}}},
+        "readiness": {"type": "object", "required": ["resume", "sync", "clean"],
+          "properties": {"resume": {"$ref": "#/$defs/decision"}, "sync": {"$ref": "#/$defs/decision"},
+            "clean": {"allOf": [{"$ref": "#/$defs/decision"}, {"required": ["safe_item_ids"], "properties": {"safe_item_ids": {"type": "array", "items": {"type": "string"}}}}]}}},
+        "disk": {"type": "object", "required": ["measurements", "reused_measurements", "estimated", "complete", "errors"],
+          "properties": {"measurements": {"type": "object", "additionalProperties": {"type": "object", "required": ["bytes", "measured_at", "reused", "complete"], "properties": {"bytes": {"type": "integer", "minimum": 0}, "measured_at": {"type": "number"}, "reused": {"type": "boolean"}, "complete": {"type": "boolean"}}}}}}
+      },
+      "if": {"not": {"required": ["error"]}},
+      "then": {"required": ["branch", "head", "health", "errors", "dirty", "stashes", "stash_scope", "branches", "remotes", "worktree_inventory", "items", "disk"]}
+    }
+  }
+}

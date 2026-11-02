@@ -3,10 +3,41 @@
 ## Automated
 
 ```
+py -3 -m pip install -r requirements-dev.txt
 py -3 -m unittest discover -s tests -v
 ```
 
-CI (`.github/workflows/ci.yml`) runs these on Windows, Linux and macOS with Python 3.10 and 3.13 and
+The core itself remains standard-library only; the development dependency validates
+the published JSON Schema. Without it only the schema-validation test is skipped.
+
+`tests/test_snapshot.py` covers the CLI/Python/Aura contracts, immutable repository
+bytes during snapshots, stable IDs, partial-result exit codes, failed/multiple
+remotes, credential redaction, unusual literal paths, linked-only discovery, locks,
+missing agent worktrees, incremental size provenance with live reclassification,
+overlapping estimates, bare/unborn repositories and interrupted operations.
+Review regressions also cover excluded linked worktrees and enclosing cleanup
+candidates, plus detached-only history backed up and restored into a fresh clone.
+Newline/quote worktree paths run on Linux/macOS; Windows forbids such filenames.
+
+On restricted Windows runners, set TEMP and TMP to a writable task-local scratch
+directory. MinGit also requires Windows named-object access for local clone/fetch;
+a sandbox refusal is an environment failure, not a Git regression.
+
+### Performance observation (2026-11-03)
+
+A disposable real-Git fixture with 2,000 ignored 1 KiB files across 40 package
+directories required 67 Python directory reads for a full snapshot and 1 for a
+refresh using the previous snapshot. Elapsed scan times on this Windows host were
+2,378 ms and 1,904 ms, respectively; both reported 2,048,000 reclaimable bytes and
+complete Git inventory. This is a single local measurement, not a general speed
+guarantee. The regression test additionally proves cached sizes cannot conceal new
+dirty/staged files, unpushed commits or newly tracked files in a cleanup candidate.
+
+The WPF Release build was checked locally with .NET SDK 10.0.401: zero warnings and
+zero errors. Native layout/interaction and Aura deployment require separate review;
+the integration delivered here is the versioned producer and example consumer.
+
+CI (`.github/workflows/ci.yml`) runs these on Windows, Linux and macOS with Python 3.11 and 3.14 and
 builds the widget on Windows. Pushing a `v*` tag runs `.github/workflows/release.yml`, which tests
 again, checks the tag matches both version numbers and publishes the downloads.
 
