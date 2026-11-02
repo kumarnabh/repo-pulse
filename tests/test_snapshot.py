@@ -90,6 +90,70 @@ class TestSnapshot(Fixture):
         with patch.object(rp.os, "scandir", side_effect=AssertionError("Excluded root was walked")):
             self.assertEqual(rp.discover([str(self.repo)], hints=False, exclude=[str(self.repo)]), [])
 
+    def test_excluded_linked_worktree_is_never_inspected_or_offered(self):
+        wt = self.tmp / "excluded-agent"
+        g(self.repo, "worktree", "add", "-q", str(wt), "-b", "excluded-agent")
+        self.fetch()
+        real_dirty = rp.dirty_state
+        inspected = []
+
+        def observe(path):
+            inspected.append(rp._norm_key(str(path)))
+            return real_dirty(path)
+
+        with patch.object(rp, "dirty_state", side_effect=observe):
+            data = self.snapshot("--exclude-path", str(wt))
+        self.assertNotIn(rp._norm_key(str(wt)), inspected)
+        main = data["repos"][0]
+        self.assertNotIn(str(wt), [i["target"] for i in main["items"]])
+        self.assertNotIn(str(wt), [t["path"] for t in main["worktree_inventory"]])
+        branch = by_target(main, "branch", "excluded-agent")
+        self.assertEqual(branch["status"], "keep")
+        self.assertEqual(branch["checked_out_paths"], [])
+
+    def test_detached_only_commits_are_backed_up_and_restorable(self):
+        g(self.repo, "switch", "-q", "--detach")
+        commit(self.repo, "detached-only.txt")
+        head = g(self.repo, "rev-parse", "HEAD")
+        result = rp.cmd_backup(rp.build_parser().parse_args([
+            "backup", "--repo", str(self.repo), "--dest", str(self.dest)]))
+        self.assertTrue(result["ok"], result)
+        bundle = Path(result["backup"]) / "unpushed.bundle"
+        self.assertTrue(bundle.exists(), "Successful backup omitted detached-only history")
+        self.assertIn(head, g(self.repo, "bundle", "list-heads", str(bundle)))
+        fresh = self.other_clone()
+        original = g(fresh, "rev-parse", "HEAD")
+        restored = rp.cmd_restore(rp.build_parser().parse_args([
+            "restore", "--backup", result["backup"], "--repo", str(fresh), "--parts", "commits", "--dest", str(self.dest)]))
+        self.assertTrue(restored["ok"], restored)
+        self.assertEqual(g(fresh, "rev-parse", "recovered-detached-" + head[:12]), head)
+        self.assertEqual(g(fresh, "rev-parse", "HEAD"), original)
+
+    def test_excluded_descendant_blocks_enclosing_cleanup(self):
+        wt = self.tmp / "agent"
+        g(self.repo, "worktree", "add", "-q", str(wt), "-b", "agent")
+        commit(wt, ".gitignore", "node_modules/\n")
+        commit(wt, "package.json", "{}")
+        g(wt, "push", "-qu", "origin", "agent")
+        self.fetch()
+        excluded = wt / "node_modules" / "private"
+        excluded.mkdir(parents=True)
+        (excluded / "data.txt").write_text("retain")
+        real_walk = rp.os.scandir
+        visited = []
+
+        def observe(path):
+            visited.append(rp._norm_key(str(path)))
+            return real_walk(path)
+
+        with patch.object(rp.os, "scandir", side_effect=observe):
+            data = self.snapshot("--exclude-path", str(excluded))
+        main = next(r for r in data["repos"] if r["kind"] == "repo")
+        self.assertEqual(by_target(main, "worktree", str(wt))["status"], "keep")
+        self.assertNotIn(rp._norm_key(str(excluded)), visited)
+        linked = next(r for r in data["repos"] if r["kind"] == "worktree")
+        self.assertFalse(any(i["target"] == "node_modules" for i in linked["items"]))
+
     def test_literal_unusual_paths_and_linked_owner_discovery(self):
         wt = self.tmp / ".codex" / "worktrees" / "space ü; dollar $ [brackets]"
         g(self.repo, "worktree", "add", "-q", str(wt), "-b", "agent")

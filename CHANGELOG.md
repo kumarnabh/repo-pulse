@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Honor linked-worktree and descendant exclusions in scans and cleanup candidates;
+  preserve and restore history reachable only from a detached HEAD in backups.
 - Versioned read-only snapshot CLI/Python API for Aura, JSON Schema and example adapter.
 - Stable checkout/shared-repository IDs, complete remote/branch/worktree facts,
   explicit partial results, risk findings and resume/sync/cleanup readiness.

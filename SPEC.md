@@ -161,6 +161,9 @@ with the same name, or two backups in the same second, never share a folder):
   hash-checked against the source and refused if the source changed while it was read;
 - `changes.patch` (`git diff HEAD --binary`) and `staged.patch`;
 - `unpushed.bundle` containing commits on no remote and the newest stash (skipped when there are none);
+- detached HEAD commits are included in that bundle even when no local branch
+  reaches them; restore gives them a `recovered-detached-<tip>` branch without
+  moving the current checkout or an existing branch;
 - `stash-N.patch` for every stash entry (`stash-0` is the newest), including untracked files on git 2.32+;
 - `manifest.json` with branch, HEAD, file list, SHA-256 of every saved file, symlinks (recorded, never
   followed), problems, and restore instructions.

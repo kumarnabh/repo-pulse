@@ -20,6 +20,11 @@ Prefer these over the legacy semicolon-separated `--roots`/`--exclude`, especial
 for paths containing semicolons. Pass arguments as an array with `shell=False`.
 Explicit repositories include registered linked worktrees and their owner;
 exclusions apply to all sources. Submodules are not independently inventoried.
+Excluded checkouts are not inspected or offered for cleanup. Their registrations
+still protect checked-out branches from deletion. Enclosing generated folders and
+worktrees containing an excluded descendant are retained. Git status in an included
+checkout still describes its complete dirty state, including tracked files below
+excluded discovery folders.
 Bare repositories are reported but cannot be resumed as working checkouts.
 Folder discovery defaults to depth 6; `--depth` adjusts it, up to 64. Symlink and
 junction directories are not traversed. Inventory completeness is within that
@@ -144,7 +149,8 @@ previous snapshot fails explicitly. `--max-size-age 0` forces full measurement.
 `refresh.reused_measurements`, per-row `disk.estimated` and each measurement's
 `measured_at` expose provenance; reused sizes can differ from current disk use.
 These estimates never feed cleanup authorization. The live cleanup path always
-remeasures/revalidates. Source-tree discovery still runs to find new candidates.
+revalidates safety; reported sizes remain estimates. Source-tree discovery still
+runs to find new candidates.
 
 `totals.safe_bytes` and `review_bytes` deduplicate overlapping worktrees, generated
 folders and caches, giving the enclosing candidate's risk band priority. GC bytes

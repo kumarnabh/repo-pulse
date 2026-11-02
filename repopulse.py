@@ -608,8 +608,17 @@ def _norm_key(path: str) -> str:
 
 
 def is_excluded(path: str, excluded: list[str]) -> bool:
+    if not excluded:
+        return False
     key = _norm_key(path)
     return any(key == e or key.startswith(e.rstrip("\\/") + os.sep) for e in excluded)
+
+
+def contains_excluded(path: str, excluded: list[str]) -> bool:
+    if not excluded:
+        return False
+    key = _norm_key(path).rstrip("\\/") + os.sep
+    return any(e.startswith(key) for e in excluded)
 
 
 def discover(roots: list[str], max_depth: int = MAX_DEPTH, hints: bool = True, exclude: list[str] | None = None,
@@ -1207,7 +1216,7 @@ def recent_activity(path: str, admin: str | None, minutes: float | None = None, 
     return round(now() - newest) if newest >= cutoff else None
 
 
-def classify_worktrees(repo: Repo, trees: list[dict], measure: bool = True) -> list[dict]:
+def classify_worktrees(repo: Repo, trees: list[dict], measure: bool = True, excluded: list[str] | None = None) -> list[dict]:
     """measure=False leaves sizes to the caller (a full scan reuses each worktree row's own walk)."""
     items = []
     fresh = repo.fresh()
@@ -1217,7 +1226,9 @@ def classify_worktrees(repo: Repo, trees: list[dict], measure: bool = True) -> l
         exists = os.path.isdir(t["path"])
         admin = worktree_admin_dir(repo, t["path"])
         base = {"kind": "worktree", "target": t["path"], "branch": t["branch"], "head": t["head"], "locked": t["locked"], "bytes": 0}
-        if t["locked"]:
+        if contains_excluded(t["path"], excluded or []):
+            base.update(status="keep", reason="Contains an excluded folder; retain this worktree")
+        elif t["locked"]:
             base.update(status="keep", reason="Locked worktree")
         elif t["prunable"] or not exists:
             orphans: int | None = 0
@@ -1307,7 +1318,7 @@ def has_tracked(repo_path: str, rel: str) -> bool:
     return out is None or bool(out.strip("\0"))
 
 
-def find_junk(repo: Repo) -> tuple[list[dict], int]:
+def find_junk(repo: Repo, excluded: list[str] | None = None) -> tuple[list[dict], int]:
     """Walk the main worktree once: junk candidates plus working-tree size."""
     root = repo.path
     candidates: list[tuple[str, str]] = []
@@ -1325,6 +1336,8 @@ def find_junk(repo: Repo) -> tuple[list[dict], int]:
             continue
         for e in entries:
             try:
+                if is_excluded(e.path, excluded or []):
+                    continue
                 if is_link_like(e):
                     continue
                 if e.is_dir(follow_symlinks=False):
@@ -1334,6 +1347,8 @@ def find_junk(repo: Repo) -> tuple[list[dict], int]:
                         continue  # nested repo or linked worktree: scanned separately
                     rel = os.path.relpath(os.path.join(current, e.name), root)
                     if e.name in JUNK_RULES or (e.name in ("venv",) and os.path.exists(os.path.join(e.path, "pyvenv.cfg"))):
+                        if contains_excluded(e.path, excluded or []):
+                            continue  # never measure or offer an enclosing cleanup that would remove an exclusion
                         candidates.append((rel, e.name))
                         continue
                     if depth < JUNK_DEPTH:
@@ -1409,7 +1424,8 @@ def gc_item(repo: Repo) -> dict | None:
 
 # ---------------------------------------------------------------- scan
 
-def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True) -> dict:
+def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True,
+              excluded: list[str] | None = None) -> dict:
     started = now()
     try:
         repo = Repo(path)
@@ -1524,7 +1540,9 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
         branches = classify_branches(repo, trees)
         if branches is None:
             errors.append("Could not list branches")
-        items = (branches or []) + (classify_worktrees(repo, trees, measure_worktrees) if listed is not None else [])
+        visible = [t for t in trees if not is_excluded(t["path"], excluded or [])]
+        # Keep all registrations for branch protection, but never inspect excluded checkouts.
+        items = (branches or []) + (classify_worktrees(repo, visible, measure_worktrees, excluded) if listed is not None else [])
     else:
         listed = repo.worktrees()
         if listed is None:
@@ -1536,7 +1554,7 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
             own = next((t for t in trees if _norm_key(t["path"]) == _norm_key(repo.path)), None)
             if own and own["locked"]:
                 result["operations_in_progress"].append("Worktree is locked: " + (own["lock_reason"] or "no reason recorded"))
-    junk, wt_bytes = find_junk(repo) if not repo.bare else ([], 0)
+    junk, wt_bytes = find_junk(repo, excluded) if not repo.bare else ([], 0)
     items += junk
     g = None if is_wt else gc_item(repo)
     if g:
@@ -1545,12 +1563,15 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
         it["id"] = item_id(it["kind"], repo.path, it["target"])
     result["items"] = items
     result["branches"] = [i for i in items if i["kind"] == "branch"]
+    for branch in result["branches"]:
+        branch["checked_out_paths"] = [p for p in branch["checked_out_paths"] if not is_excluded(p, excluded or [])]
     if any(b["unpushed"] is None and repo.remote for b in result["branches"]):
         errors.append("Could not verify branch reachability against remotes")
-    result["worktree_inventory"] = worktree_inventory(repo, trees, items)
+    visible = [t for t in trees if not is_excluded(t["path"], excluded or [])]
+    result["worktree_inventory"] = worktree_inventory(repo, visible, items)
     result["unpushed_branches"] = [{"name": b["target"], "commits": b["unpushed"]} for b in items
                                    if b["kind"] == "branch" and b.get("unpushed")]
-    result["worktrees"] = 0 if is_wt else len([t for t in trees if not t["main"]])
+    result["worktrees"] = 0 if is_wt else len([t for t in visible if not t["main"]])
     result["worktree_bytes"] = wt_bytes
     result["git_bytes"] = 0 if is_wt else dir_size(repo.git_dir)
     errors.extend(e for e in repo.read_errors if e not in errors)
@@ -1640,11 +1661,11 @@ def read_previous_sizes(path: str | None) -> dict:
     return sizes
 
 
-def scan_with_sizes(path: str, previous: dict, max_age: float) -> dict:
+def scan_with_sizes(path: str, previous: dict, max_age: float, excluded: list[str] | None = None) -> dict:
     context = {"previous": previous, "max_age": max_age, "measurements": {}, "walk_errors": []}
     token = SIZE_CONTEXT.set(context)
     try:
-        row = scan_repo(path, False, False)
+        row = scan_repo(path, False, False, excluded)
         row["disk"] = {"measurements": context["measurements"],
                        "reused_measurements": sum(m["reused"] for m in context["measurements"].values()),
                        "estimated": any(m["reused"] for m in context["measurements"].values()),
@@ -1662,12 +1683,13 @@ def cmd_scan(args) -> dict:
     roots = (getattr(args, "root", None) or []) + [r for r in (args.roots or "").split(";") if r.strip()]
     roots = roots or default_roots()
     exclusions = (getattr(args, "exclude_path", None) or []) + [p for p in (args.exclude or "").split(";") if p.strip()]
+    excluded = [_norm_key(p) for p in exclusions]
     if args.repo:
-        entries = [{"path": os.path.abspath(os.path.expanduser(p)), "kind": git_kind(os.path.expanduser(p)) or "repo", "source": "argument"} for p in args.repo]
+        entries = [{"path": os.path.abspath(os.path.expanduser(p)), "kind": git_kind(os.path.expanduser(p)) or "repo", "source": "argument"}
+                   for p in args.repo if not is_excluded(p, excluded)]
         if args.cmd == "snapshot":
             linked = discover([e["path"] for e in entries], 0, hints=False, exclude=exclusions, diagnostics=diagnostics)
             entries += linked
-        excluded = [_norm_key(p) for p in exclusions]
         entries = list({_norm_key(e["path"]): e for e in entries if not is_excluded(e["path"], excluded)}.values())
         roots = sorted({_norm_key(p) for p in args.repo})
     else:
@@ -1681,7 +1703,7 @@ def cmd_scan(args) -> dict:
                 fetch_errors[os.path.normcase(path)] = err
     results = []
     with cf.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(scan_with_sizes, e["path"], previous, getattr(args, "max_size_age", 300)): e for e in entries}
+        futures = {pool.submit(scan_with_sizes, e["path"], previous, getattr(args, "max_size_age", 300), excluded): e for e in entries}
         for fut in cf.as_completed(futures):
             e = futures[fut]
             try:
@@ -1861,6 +1883,9 @@ def repo_backup_dir(dest: str | None, repo: Repo) -> Path:
 
 def cmd_backup(args) -> dict:
     repo = Repo(args.repo)
+    branch = (git_ok(repo.path, "symbolic-ref", "--quiet", "--short", "HEAD") or "").strip() or None
+    head = (git_ok(repo.path, "rev-parse", "--verify", "-q", "HEAD") or "").strip() or None
+    detached = head is not None and branch is None
     problems: list[dict] = []  # anything not saved and proven restorable makes the backup incomplete
     changed: set[str] = set()
     deleted: list[str] = []
@@ -1963,10 +1988,19 @@ def cmd_backup(args) -> dict:
 
     bundle = None
     refs = ["--branches"]
+    if detached:
+        refs.append("HEAD")
     stash_sha = (git_ok(repo.path, "rev-parse", "--verify", "-q", "refs/stash") or "").strip()
     if stash_sha:
         refs.append("refs/stash")
-    unp = repo.unpushed("--branches") if repo.remote else None
+    if repo.remote and detached:
+        out = git_ok(repo.path, "rev-list", "--count", "--branches", "HEAD", "--not", "--remotes")
+        unp = int(out.strip()) if out and out.strip().isdigit() else None
+    else:
+        unp = repo.unpushed("--branches") if repo.remote else None
+    detached_unp = repo.unpushed("HEAD") if detached and repo.remote else None
+    if detached and repo.remote and detached_unp is None:
+        problems.append({"part": "bundle", "error": "could not verify detached HEAD reachability"})
     if repo.remote and unp is None:
         problems.append({"part": "bundle", "error": "could not count unpushed commits"})
     lfs = repo_features(repo).get("lfs")
@@ -1977,7 +2011,8 @@ def cmd_backup(args) -> dict:
         neg = ["--not", "--remotes"] if repo.remote else []
         path = dest / "unpushed.bundle"
         code, _, err = git(repo.path, "bundle", "create", str(path), *refs, *neg, timeout=600)
-        why = (f"bundle failed: {err}" if code != 0 else bundle_holds(repo, path, [stash_sha]))
+        expected = [stash_sha] + ([head] if detached and (detached_unp or not repo.remote) else [])
+        why = (f"bundle failed: {err}" if code != 0 else bundle_holds(repo, path, expected))
         if why:
             problems.append({"part": "bundle", "path": "unpushed.bundle", "error": why})
         else:
@@ -1985,10 +2020,9 @@ def cmd_backup(args) -> dict:
         bundle = {"file": "unpushed.bundle", "ok": why is None, "error": why, "unpushed_commits": unp, "stashes": stash_n}
 
     complete = not problems
-    head = (git_ok(repo.path, "rev-parse", "HEAD") or "").strip() or None
     manifest = {
         "format": 2, "repo": repo.path, "created": dt.datetime.now().isoformat(timespec="seconds"), "head": head,
-        "branch": (git_ok(repo.path, "symbolic-ref", "--quiet", "--short", "HEAD") or "").strip() or None,
+        "branch": branch,
         "complete": complete, "files": sorted(k[6:] for k in hashes if k.startswith("files/")),
         "sha256": hashes,  # keyed by path inside this backup folder
         "links": links, "failed": [p for p in problems if p["part"] == "file"], "problems": problems,
@@ -2466,9 +2500,14 @@ def restore_bundle_branches(repo: Repo, bundle: Path, tag: str, only: list[str] 
     results = []
     for line in out.splitlines():
         sha, _, ref = line.strip().partition(" ")
-        if not ref.startswith("refs/heads/"):
+        source_ref = ref
+        if ref == "HEAD":
+            name = f"recovered-detached-{sha[:12]}"
+            ref = f"refs/heads/{name}"
+        elif ref.startswith("refs/heads/"):
+            name = ref[len("refs/heads/"):]
+        else:
             continue
-        name = ref[len("refs/heads/"):]
         if only and name not in only:
             continue
         cur = (git_ok(repo.path, "rev-parse", "--verify", "-q", ref) or "").strip()
@@ -2480,7 +2519,7 @@ def restore_bundle_branches(repo: Repo, bundle: Path, tag: str, only: list[str] 
                             "exists with other commits; the backup tip would be kept beside it"})
             continue
         side = f"refs/repopulse-backup/{tag}/{name}"
-        code, _, err = git(repo.path, "fetch", "--no-tags", "--quiet", str(bundle), f"{ref}:{side}", timeout=600)
+        code, _, err = git(repo.path, "fetch", "--no-tags", "--quiet", str(bundle), f"{source_ref}:{side}", timeout=600)
         if code:
             results.append({"branch": name, "done": False, "reason": err})
             continue

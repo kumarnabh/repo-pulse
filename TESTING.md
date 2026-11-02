@@ -15,6 +15,8 @@ bytes during snapshots, stable IDs, partial-result exit codes, failed/multiple
 remotes, credential redaction, unusual literal paths, linked-only discovery, locks,
 missing agent worktrees, incremental size provenance with live reclassification,
 overlapping estimates, bare/unborn repositories and interrupted operations.
+Review regressions also cover excluded linked worktrees and enclosing cleanup
+candidates, plus detached-only history backed up and restored into a fresh clone.
 Newline/quote worktree paths run on Linux/macOS; Windows forbids such filenames.
 
 On restricted Windows runners, set TEMP and TMP to a writable task-local scratch
