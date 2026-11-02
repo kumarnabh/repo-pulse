@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import contextvars
 import datetime as dt
 import hashlib
 import json
@@ -25,8 +26,10 @@ import time
 from pathlib import Path
 
 VERSION = "0.5.0"
+SCHEMA_VERSION = "1.0"
 IS_WIN = os.name == "nt"
 FRESH_HOURS = 24
+FETCH_CLOCK_SKEW_SECONDS = 60  # tolerate filesystem/tool clock rounding, not arbitrary future evidence
 ACTIVE_MINUTES = float(os.environ.get("REPOPULSE_ACTIVE_MINUTES") or 30)  # 0 disables the in-use check
 GC_THRESHOLD = 50 * 1024 * 1024
 DEFAULT_NAMES = ("main", "master", "trunk", "develop")
@@ -111,7 +114,8 @@ GIT_OPTS = ["-c", "core.quotepath=off", "-c", "color.ui=never"] + (["-c", "core.
 def git(repo: str | Path, *args: str, timeout: float = 60, stdin: bytes | None = None,
         extra_env: dict | None = None) -> tuple[int, str, str]:
     cmd = ["git", "-C", str(repo), *GIT_OPTS, *args]
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GCM_INTERACTIVE="never", LC_ALL="C", **(extra_env or {}))
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1",
+               GCM_INTERACTIVE="never", LC_ALL="C", **(extra_env or {}))
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WIN else 0
     try:
         r = subprocess.run(cmd, input=stdin, capture_output=True, timeout=timeout, env=env, creationflags=flags)
@@ -124,7 +128,7 @@ def git(repo: str | Path, *args: str, timeout: float = 60, stdin: bytes | None =
 
 def git_bytes(repo: str | Path, *args: str, timeout: float = 60) -> tuple[int, bytes]:
     cmd = ["git", "-C", str(repo), *GIT_OPTS, *args]
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GCM_INTERACTIVE="never")
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GCM_INTERACTIVE="never")
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WIN else 0
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=timeout, env=env, creationflags=flags)
@@ -138,8 +142,18 @@ def git_ok(repo, *args, timeout=60) -> str | None:
     return out if code == 0 else None
 
 
+SIZE_CONTEXT = contextvars.ContextVar("size_context", default=None)
+
+
 def dir_size(path: str | Path, limit_depth: int = 64) -> int:
+    context = SIZE_CONTEXT.get()
+    key = _norm_key(str(path))
+    cached = context["previous"].get(key) if context and limit_depth == 64 else None
+    if cached and context["max_age"] > 0 and 0 <= now() - cached["measured_at"] <= context["max_age"]:
+        context["measurements"][key] = {**cached, "reused": True}
+        return cached["bytes"]
     total = 0
+    complete = True
     stack = [(longp(path), 0)]
     while stack:
         current, depth = stack.pop()
@@ -155,9 +169,13 @@ def dir_size(path: str | Path, limit_depth: int = 64) -> int:
                         else:
                             total += e.stat(follow_symlinks=False).st_size
                     except OSError:
+                        complete = False
                         continue
         except OSError:
+            complete = False
             continue
+    if context and limit_depth == 64:
+        context["measurements"][key] = {"bytes": total, "measured_at": now(), "reused": False, "complete": complete}
     return total
 
 
@@ -484,6 +502,11 @@ def git_kind(folder: str) -> str | None:
             return None
         if target.startswith("gitdir:") and "/worktrees/" in target:
             return "worktree"
+        if target.startswith("gitdir:") and "/modules/" not in target:
+            return "repo"  # separate git directory; Repo validates the actual top-level path
+    if os.path.isfile(os.path.join(folder, "HEAD")) and os.path.isdir(os.path.join(folder, "objects")):
+        if (git_ok(folder, "rev-parse", "--is-bare-repository") or "").strip() == "true":
+            return "repo"
     return None
 
 
@@ -573,9 +596,11 @@ def enclosing_git(path: str) -> tuple[str, str] | None:
 
 
 def linked_worktrees(repo_path: str) -> list[str]:
-    out = git_ok(repo_path, "worktree", "list", "--porcelain") or ""
-    paths = [line[9:] for line in out.splitlines() if line.startswith("worktree ")]
-    return [os.path.normpath(p) for p in paths[1:] if os.path.isdir(p) and git_kind(p) == "worktree"]
+    out = git_ok(repo_path, "worktree", "list", "--porcelain", "-z")
+    if out is None:
+        return []
+    return [os.path.normpath(t["path"]) for t in parse_worktrees(out)[1:]
+            if os.path.isdir(t["path"]) and git_kind(t["path"]) == "worktree"]
 
 
 def _norm_key(path: str) -> str:
@@ -587,7 +612,8 @@ def is_excluded(path: str, excluded: list[str]) -> bool:
     return any(key == e or key.startswith(e.rstrip("\\/") + os.sep) for e in excluded)
 
 
-def discover(roots: list[str], max_depth: int = MAX_DEPTH, hints: bool = True, exclude: list[str] | None = None) -> list[dict]:
+def discover(roots: list[str], max_depth: int = MAX_DEPTH, hints: bool = True, exclude: list[str] | None = None,
+             diagnostics: list[dict] | None = None) -> list[dict]:
     """Main repos and linked worktrees under the roots, from tool history, and from each repo's worktree list."""
     found: dict[str, dict] = {}
     excluded = [_norm_key(e) for e in exclude or [] if e.strip()]
@@ -599,7 +625,11 @@ def discover(roots: list[str], max_depth: int = MAX_DEPTH, hints: bool = True, e
 
     for root in roots:
         root = os.path.abspath(os.path.expanduser(root))
+        if is_excluded(root, excluded):
+            continue
         if not os.path.isdir(root):
+            if diagnostics is not None:
+                diagnostics.append({"path": root, "code": "root_unavailable", "message": "Scan root is missing or inaccessible"})
             continue
         stack = [(root, 0)]
         while stack:
@@ -623,13 +653,22 @@ def discover(roots: list[str], max_depth: int = MAX_DEPTH, hints: bool = True, e
                         if excluded and is_excluded(e.path, excluded):
                             continue
                         stack.append((e.path, depth + 1))
-            except OSError:
+            except OSError as exc:
+                if diagnostics is not None:
+                    diagnostics.append({"path": current, "code": "discovery_unreadable", "message": str(exc)})
                 continue
     if hints:
         for path, source in hint_paths():
             hit = enclosing_git(path)
             if hit:
                 add(hit[0], hit[1], source)
+    # A linked worktree discovered alone must bring its owning worktree into the inventory.
+    for entry in list(found.values()):
+        if entry["kind"] == "worktree":
+            out = git_ok(entry["path"], "worktree", "list", "--porcelain", "-z")
+            trees = parse_worktrees(out) if out is not None else []
+            if trees and not trees[0]["bare"]:
+                add(trees[0]["path"], "repo", "worktree owner")
     for entry in [e for e in found.values() if e["kind"] == "repo"]:
         for wt in linked_worktrees(entry["path"]):
             add(wt, "worktree", "worktree list")
@@ -638,15 +677,48 @@ def discover(roots: list[str], max_depth: int = MAX_DEPTH, hints: bool = True, e
 
 # ---------------------------------------------------------------- repo facts
 
+def parse_worktrees(text: str) -> list[dict]:
+    """Porcelain -z keeps embedded newlines, tabs and quotes in paths/reasons literal."""
+    trees = []
+    for block in text.split("\0\0"):
+        cur = None
+        for field in block.split("\0"):
+            key, _, value = field.partition(" ")
+            if key == "worktree":
+                cur = {"path": os.path.normpath(value), "head": None, "branch": None,
+                       "locked": False, "lock_reason": None, "prunable": False,
+                       "prune_reason": None, "bare": False, "main": not trees}
+                trees.append(cur)
+            elif cur is not None:
+                if key == "HEAD":
+                    cur["head"] = None if value and set(value) == {"0"} else value
+                elif key == "branch":
+                    cur["branch"] = value.removeprefix("refs/heads/")
+                elif key in ("bare", "locked", "prunable"):
+                    cur[key] = True
+                    if key in ("locked", "prunable"):
+                        cur["lock_reason" if key == "locked" else "prune_reason"] = value or None
+    return trees
+
+
 class Repo:
     def __init__(self, path: str):
         self.path = os.path.abspath(path)
         self.name = os.path.basename(self.path.rstrip("\\/")) or self.path
+        self.bare = (git_ok(self.path, "rev-parse", "--is-bare-repository") or "").strip() == "true"
+        top = git_ok(self.path, "rev-parse", "--show-toplevel") if not self.bare else None
+        if not self.bare and (top is None or _norm_key(top.strip()) != _norm_key(self.path)):
+            raise RuntimeError("Not a readable repository root; Git resolved a parent or the metadata is invalid.")
         common = git_ok(self.path, "rev-parse", "--path-format=absolute", "--git-common-dir")
         if common is None:
             raise RuntimeError("Not a readable git repository (check safe.directory or permissions).")
         self.git_dir = common.strip()
-        remotes = (git_ok(self.path, "remote") or "").split()
+        if self.bare and _norm_key(self.git_dir) != _norm_key(self.path):
+            raise RuntimeError("Not a bare repository root; Git resolved a parent repository.")
+        remote_out = git_ok(self.path, "remote")
+        self.read_errors = [] if remote_out is not None else ["Could not list remotes"]
+        remotes = (remote_out or "").splitlines()
+        self.remotes = remotes
         self.remote = "origin" if "origin" in remotes else (remotes[0] if remotes else None)
         self.default = self._default_branch()
         self.has_head = git_ok(self.path, "rev-parse", "--verify", "-q", "HEAD") is not None
@@ -699,19 +771,21 @@ class Repo:
         except OSError:
             pass
 
-    def last_fetch(self) -> float | None:
+    def last_fetch(self, remote: str | None = None) -> float | None:
         """Time of the last fetch of this repo's remote known to have succeeded.
 
         FETCH_HEAD is shared by every remote and is rewritten even by a fetch that fails part-way, so a
         fetch that Repo Pulse saw fail only counts as fresh again after a later successful fetch, or after
         FETCH_HEAD is rewritten by another tool after that failure.
         """
-        entry = self.fetch_state().get(self.remote) or {}
+        entry = self.fetch_state().get(remote or self.remote) or {}
+        if not isinstance(entry, dict):
+            return None
         ok_t, fail_t = entry.get("ok"), entry.get("failed")
-        times = [ok_t] if isinstance(ok_t, (int, float)) else []
+        times = [ok_t] if isinstance(ok_t, (int, float)) and (not isinstance(fail_t, (int, float)) or ok_t > fail_t) else []
         try:
             fh = os.path.getmtime(os.path.join(self.git_dir, "FETCH_HEAD"))
-            if not isinstance(fail_t, (int, float)) or fh > fail_t:
+            if len(self.remotes) == 1 and (not isinstance(fail_t, (int, float)) or fh > fail_t):
                 times.append(fh)
         except OSError:
             pass
@@ -722,8 +796,8 @@ class Repo:
         return None if t is None else round((now() - t) / 3600, 2)
 
     def fresh(self) -> bool:
-        age = self.fetched_age_h()
-        return age is not None and age <= FRESH_HOURS
+        fetched = self.last_fetch()
+        return fetched is not None and -FETCH_CLOCK_SKEW_SECONDS <= now() - fetched <= FRESH_HOURS * 3600
 
     def admin_dirs(self) -> list[str]:
         """The common git dir plus every linked worktree's private git dir."""
@@ -796,42 +870,28 @@ class Repo:
 
     def worktrees(self) -> list[dict] | None:
         """Parsed `git worktree list`; None when git could not list them."""
-        out = git_ok(self.path, "worktree", "list", "--porcelain")
+        out = git_ok(self.path, "worktree", "list", "--porcelain", "-z")
         if out is None:
             return None
-        trees, cur = [], None
-        for line in out.splitlines():
-            if line.startswith("worktree "):
-                cur = {"path": line[9:], "head": None, "branch": None, "locked": False, "prunable": False, "bare": False}
-                trees.append(cur)
-            elif cur is None:
-                continue
-            elif line.startswith("HEAD "):
-                cur["head"] = line[5:]
-            elif line.startswith("branch "):
-                cur["branch"] = line[7:].removeprefix("refs/heads/")
-            elif line == "bare":
-                cur["bare"] = True
-            elif line.startswith("locked"):
-                cur["locked"] = True
-            elif line.startswith("prunable"):
-                cur["prunable"] = True
-        for i, t in enumerate(trees):
-            t["main"] = i == 0
-        return trees
+        return parse_worktrees(out)
 
 
 def repo_features(repo: Repo) -> dict:
     """Layouts that change what is safe: shallow and partial clones, sparse checkout, Git LFS, submodules."""
-    cfg = (git_ok(repo.path, "config", "--get-regexp",
-                  r"^(remote\..*\.promisor|extensions\.partialclone|core\.sparsecheckout)$") or "").lower()
+    code, cfg, _ = git(repo.path, "config", "--get-regexp",
+                       r"^(remote\..*\.promisor|extensions\.partialclone|core\.sparsecheckout)$")
+    config_known = code in (0, 1)
+    cfg = cfg.lower()
+    shallow = git_ok(repo.path, "rev-parse", "--is-shallow-repository")
+    if not config_known or shallow is None:
+        repo.read_errors.append("Could not determine clone features")
     try:
         attrs = Path(repo.path, ".gitattributes").read_text(encoding="utf-8", errors="replace")
     except OSError:
         attrs = ""
     return {
-        "shallow": (git_ok(repo.path, "rev-parse", "--is-shallow-repository") or "").strip() == "true",
-        "partial_clone": "promisor true" in cfg or "extensions.partialclone" in cfg,
+        "shallow": shallow.strip() == "true" if shallow is not None else None,
+        "partial_clone": ("promisor true" in cfg or "extensions.partialclone" in cfg) if config_known else None,
         "sparse": "core.sparsecheckout true" in cfg,
         "lfs": "filter=lfs" in attrs or os.path.isdir(os.path.join(repo.git_dir, "lfs")),
         "submodules": os.path.isfile(os.path.join(repo.path, ".gitmodules")),
@@ -858,6 +918,115 @@ def remote_health(repo: Repo) -> list[dict]:
     if repo.remote and not repo.ref_exists(f"refs/remotes/{repo.remote}/HEAD"):
         notes.append({"level": "info", "text": f"{repo.remote}/HEAD is not set; run git remote set-head {repo.remote} --auto"})
     return notes
+
+
+def public_remote_url(url: str) -> str:
+    """Remote inventory is useful to clients, embedded credentials are not."""
+    if "://" in url:
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.netloc.rsplit("@", 1)[-1]
+        return urllib.parse.urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+    return url
+
+
+def remote_inventory(repo: Repo, errors: list[str]) -> list[dict]:
+    state = repo.fetch_state()
+    rows = []
+    for name in sorted(repo.remotes):
+        urls = {}
+        for mode, flags in (("fetch_urls", []), ("push_urls", ["--push"])):
+            out = git_ok(repo.path, "remote", "get-url", *flags, "--all", name)
+            if out is None:
+                errors.append(f"Could not read {mode} for remote {name}")
+            urls[mode] = [public_remote_url(u) for u in (out or "").splitlines()]
+        entry = state.get(name) if isinstance(state.get(name), dict) else {}
+        last = repo.last_fetch(name)
+        age = None if last is None else max(0, round((now() - last) / 3600, 2))
+        failed = entry.get("failed")
+        failed = failed if isinstance(failed, (int, float)) else None
+        recorded = entry.get("ok")
+        success = last if last is not None else recorded if isinstance(recorded, (int, float)) else None
+        rows.append({"name": name, **urls, "last_success_at": success, "last_failure_at": failed,
+                     "fresh": last is not None and -FETCH_CLOCK_SKEW_SECONDS <= now() - last <= FRESH_HOURS * 3600,
+                     "fetched_age_h": age, "contact": "failed" if failed and (last is None or failed >= last) else "not_checked"})
+    return rows
+
+
+def agent_origin(path: str) -> str | None:
+    path = path.replace("\\", "/").lower()
+    if "/.codex/worktrees/" in path:
+        return "codex"
+    if "/.claude/worktrees/" in path or "/.claude-worktrees/" in path:
+        return "claude"
+    return None
+
+
+def worktree_inventory(repo: Repo, trees: list[dict], items: list[dict]) -> list[dict]:
+    classified = {_norm_key(i["target"]): i for i in items if i["kind"] == "worktree"}
+    rows = []
+    for t in trees:
+        item = classified.get(_norm_key(t["path"]))
+        exists = os.path.isdir(t["path"])
+        agent = agent_origin(t["path"])
+        orphan = "missing" if not exists else "candidate" if agent and item and item["status"] in ("safe", "review") else "not_proven"
+        rows.append({**t, "exists": exists, "agent_origin": agent, "orphan_status": orphan,
+                     "stale": bool(t["prunable"] or not exists),
+                     "cleanup_status": item["status"] if item else "keep",
+                     "reason": item["reason"] if item else "Main worktree or bare repository is retained",
+                     "bytes": item.get("bytes") if item else None})
+    return rows
+
+
+def assess_readiness(row: dict) -> None:
+    """Advisory only. Action commands must always perform their own checks."""
+    findings = []
+
+    def note(code: str, level: str, reason: str, guidance: str) -> None:
+        findings.append({"code": code, "level": level, "reason": reason, "guidance": guidance})
+
+    if row.get("error") or row.get("health") == "unknown":
+        note("inventory_unknown", "unknown", row.get("error") or "; ".join(row.get("errors") or []),
+             "Resolve Git access/read errors and refresh before making decisions.")
+    if row.get("operations_in_progress"):
+        note("operation_in_progress", "blocked", "; ".join(row["operations_in_progress"]),
+             "Inspect git status and Repo Pulse recover. Finish or deliberately recover the operation; do not remove locks blindly.")
+    if row.get("dirty", {}).get("conflicted"):
+        note("conflicts", "blocked", "Unresolved conflicts", "Preserve a backup and resolve the interrupted Git operation manually.")
+    if row.get("dirty", {}).get("total"):
+        note("uncommitted_changes", "protected", "Working tree contains uncommitted files", "Resume in this checkout; back up before syncing or cleaning.")
+    if row.get("detached"):
+        note("detached_head", "protected", "HEAD is detached", "Create a named branch at HEAD before leaving or removing this checkout.")
+    if row.get("unpushed_branches") or row.get("branch_ahead"):
+        note("unpushed_commits", "protected", "Local commits differ from remote-tracking refs", "Back up or push intentionally; fetch before judging current remote state.")
+    if row.get("stashes"):
+        note("stashes", "protected", "Repository has shared stash entries", "Inspect git stash list; Repo Pulse backup includes stashes.")
+    if not row.get("error") and not row.get("remote") and not row.get("unborn"):
+        note("local_only", "protected", "No configured remote protects this history", "Keep a verified backup of this local repository.")
+    if row.get("bare"):
+        note("bare_repository", "review", "Bare repository has no working checkout", "Create or select a working clone before resuming development.")
+    if row.get("remote") and not row.get("fresh"):
+        note("remote_stale", "review", "Remote state is stale or a fetch failed", "Run an explicit fetch when online, then refresh. Cached refs do not prove server state.")
+    if row.get("main_state") == "diverged" or (row.get("branch_ahead") and row.get("branch_behind")):
+        note("diverged", "review", "Local and tracking histories diverged", "Back up and reconcile manually; safe sync will refuse divergence.")
+    if row.get("features", {}).get("shallow") or row.get("features", {}).get("partial_clone"):
+        note("incomplete_history", "review", "Shallow or partial clone", "Inspect clone limitations; reachability and offline object availability may be incomplete.")
+    if any(n["level"] == "warn" for n in row.get("remote_health", [])):
+        note("remote_configuration", "review", "Remote configuration needs attention", "Inspect remote_health and correct the remote/upstream before syncing.")
+    levels = {f["level"] for f in findings}
+    risk = next((level for level in ("unknown", "blocked", "protected", "review") if level in levels), "healthy")
+    hard = next((level for level in ("unknown", "blocked") if level in levels), None)
+    resume = hard or ("review" if row.get("detached") or row.get("bare") else "safe")
+    sync = hard or ("review" if (row.get("dirty", {}).get("total") or not row.get("fresh") or
+                                 row.get("main_state") not in ("in_sync", "behind") or row.get("kind") == "worktree" or row.get("bare") or
+                                 any(c in {f["code"] for f in findings} for c in ("incomplete_history", "remote_configuration"))) else "safe")
+    safe_ids = [i["id"] for i in row.get("items", []) if i["status"] == "safe"] if not hard else []
+    row["risk"] = {"level": risk, "findings": findings}
+    row["readiness"] = {
+        "resume": {"state": resume, "reason": "Inspect the findings before continuing" if resume != "safe" else "Checkout is readable; preserve its existing work"},
+        "sync": {"state": sync, "reason": "Default branch can be checked for fast-forward sync" if sync == "safe" else "Review findings; explicit sync fetches and rechecks before changing refs"},
+        "clean": {"state": hard or ("safe" if safe_ids else "review"), "safe_item_ids": safe_ids,
+                  "reason": "Only listed items are candidates; explicit selection and live revalidation are required"},
+    }
 
 
 def parse_status(text: str) -> dict:
@@ -894,7 +1063,7 @@ def dirty_state(path: str) -> dict:
     # "all" lists each file inside a new folder, so counts, previews and backups see real files
     code, out, err = git(path, "status", "--porcelain=v1", "-z", "--untracked-files=all", timeout=90)
     if code != 0:
-        return {"counts": {"total": 0}, "files": [], "error": err or "status failed"}
+        return {**parse_status(""), "error": err or "status failed"}
     return parse_status(out)
 
 
@@ -946,6 +1115,9 @@ def classify_branches(repo: Repo, trees: list[dict], only: str | None = None) ->
         base = {
             "kind": "branch", "target": name, "upstream": upstream or None, "upstream_gone": gone,
             "head": sha, "unpushed": unpushed, "merged": merged, "last_commit": int(when or 0), "bytes": 0,
+            "upstream_ahead": int(re.search(r"ahead (\d+)", track)[1]) if "ahead " in track else (0 if upstream and not gone else None),
+            "upstream_behind": int(re.search(r"behind (\d+)", track)[1]) if "behind " in track else (0 if upstream and not gone else None),
+            "checked_out_paths": [t["path"] for t in trees if t.get("branch") == name],
         }
         if name == repo.default:
             status, reason = "keep", "Default branch"
@@ -966,7 +1138,7 @@ def classify_branches(repo: Repo, trees: list[dict], only: str | None = None) ->
             status, reason = "review", "Fully on remote at last fetch, but fetch is stale; fetch first"
         elif LONG_LIVED.match(name):
             status, reason = "review", "Long-lived branch name (release, develop, staging...); confirm it is retired"
-        elif repo.features()["shallow"]:
+        elif repo.features()["shallow"] is not False or repo.features()["partial_clone"] is not False:
             status, reason = "review", "Shallow clone: history is incomplete, so this cannot be fully proven pushed"
         elif merged:
             status, reason = "safe", f"Merged into {repo.remote}/{repo.default}" + (" (upstream deleted)" if gone else "")
@@ -1049,7 +1221,7 @@ def classify_worktrees(repo: Repo, trees: list[dict], measure: bool = True) -> l
             base.update(status="keep", reason="Locked worktree")
         elif t["prunable"] or not exists:
             orphans: int | None = 0
-            if t["head"] and not t["branch"]:  # a detached HEAD may be the only reference to its commits
+            if t["head"]:  # also protect a checkout whose branch ref was removed externally
                 out = git_ok(repo.path, "rev-list", "--count", t["head"], "--not", "--branches", "--tags", "--remotes")
                 orphans = int(out.strip()) if out and out.strip().isdigit() else None
             if orphans != 0:
@@ -1086,6 +1258,8 @@ def classify_worktrees(repo: Repo, trees: list[dict], measure: bool = True) -> l
                 base.update(status="keep", reason=f"{unp} unpushed commit(s)")
             elif precious is None:
                 base.update(status="keep", reason="Could not list ignored files")
+            elif repo.features()["shallow"] is not False or repo.features()["partial_clone"] is not False:
+                base.update(status="review", reason="Incomplete clone history; verify worktree commits and objects manually")
             elif precious:
                 shown = ", ".join(precious[:3]) + ("..." if len(precious) > 3 else "")
                 base.update(status="review", reason=f"Clean and pushed, but holds {len(precious)} ignored item(s) "
@@ -1144,7 +1318,10 @@ def find_junk(repo: Repo) -> tuple[list[dict], int]:
         try:
             with os.scandir(longp(current)) as it:
                 entries = list(it)
-        except OSError:
+        except OSError as exc:
+            context = SIZE_CONTEXT.get()
+            if context is not None:
+                context["walk_errors"].append(f"{current}: {exc}")
             continue
         for e in entries:
             try:
@@ -1166,6 +1343,9 @@ def find_junk(repo: Repo) -> tuple[list[dict], int]:
                 else:
                     total += e.stat(follow_symlinks=False).st_size
             except OSError:
+                context = SIZE_CONTEXT.get()
+                if context is not None:
+                    context["walk_errors"].append(f"Could not read entry in {current}")
                 continue
     ignored = ignored_set(root, [c[0] for c in candidates])
     items = []
@@ -1237,11 +1417,11 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
         return {"path": path, "name": os.path.basename(path), "error": str(exc)}
     is_wt = git_kind(repo.path) == "worktree"
     result: dict = {"path": repo.path, "name": repo.name, "remote": repo.remote, "default": repo.default,
-                    "kind": "worktree" if is_wt else "repo"}
+                    "kind": "worktree" if is_wt else "repo", "bare": repo.bare}
     if is_wt:
         parent = os.path.normpath(os.path.dirname(repo.git_dir.rstrip("/\\")))
         result.update(parent=parent, parent_name=os.path.basename(parent))
-    errors: list[str] = []
+    errors: list[str] = list(repo.read_errors)
 
     def counts(out: str | None, what: str) -> tuple[int, int]:
         try:
@@ -1256,14 +1436,26 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
     result["fetched_age_h"] = repo.fetched_age_h()
     result["fresh"] = repo.fresh()
     cur = git_ok(repo.path, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if not repo.has_head and not cur:
+        errors.append("Could not resolve HEAD as a commit or an unborn branch")
     result["branch"] = cur.strip() if cur else None
     result["detached"] = cur is None and repo.has_head
     result["features"] = repo.features()
+    result["repository_id"] = "repo-" + hashlib.sha256(_norm_key(repo.git_dir).encode("utf-8")).hexdigest()[:24]
+    result["id"] = "checkout-" + hashlib.sha256(_norm_key(repo.path).encode("utf-8")).hexdigest()[:24]
+    result["head"] = (git_ok(repo.path, "rev-parse", "--verify", "HEAD") or "").strip() or None
+    result["unborn"] = not repo.has_head
+    result["operations_in_progress"] = repo.busy()
+    if os.path.exists(os.path.join(repo.git_dir, "repopulse.lock")):
+        result["operations_in_progress"].append("repopulse.lock; inspect recover before continuing")
+    result["remotes"] = remote_inventory(repo, errors)
     result["remote_health"] = [] if is_wt else remote_health(repo)
     result["detached_orphans"] = 0
     if result["detached"]:
         out = git_ok(repo.path, "rev-list", "--count", "HEAD", "--not", "--branches", "--remotes", "--tags")
-        result["detached_orphans"] = int(out.strip()) if out and out.strip().isdigit() else 0
+        result["detached_orphans"] = int(out.strip()) if out and out.strip().isdigit() else None
+        if result["detached_orphans"] is None:
+            errors.append("Could not verify detached HEAD reachability")
 
     # current branch vs its upstream
     up = git_ok(repo.path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}") if cur else None
@@ -1300,7 +1492,7 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
         result["remote_tip"] = int(rt) if rt and rt.strip() else None
 
     # dirty + diff preview
-    dstate = dirty_state(repo.path)
+    dstate = dirty_state(repo.path) if not repo.bare else parse_status("")
     stats = numstat(repo) if dstate["files"] else {}
     files = []
     for f in dstate["files"][:DIFF_FILES]:
@@ -1312,10 +1504,14 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
         errors.append("Could not read working-tree status: " + dstate["error"].splitlines()[-1])
     if stats is None:
         errors.append("Could not read line counts")
-    stash = git_ok(repo.path, "stash", "list")
+    if repo.bare:
+        stash = git_ok(repo.path, "reflog", "show", "--format=%H", "refs/stash") if repo.ref_exists("refs/stash") else ""
+    else:
+        stash = git_ok(repo.path, "stash", "list")
     if stash is None:
         errors.append("Could not list stashes")
     result["stashes"] = len([l for l in (stash or "").splitlines() if l.strip()])
+    result["stash_scope"] = "repository"
 
     # branches, worktrees and git garbage belong to the main repository row only
     trees: list[dict] = []
@@ -1329,7 +1525,18 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
         if branches is None:
             errors.append("Could not list branches")
         items = (branches or []) + (classify_worktrees(repo, trees, measure_worktrees) if listed is not None else [])
-    junk, wt_bytes = find_junk(repo)
+    else:
+        listed = repo.worktrees()
+        if listed is None:
+            errors.append("Could not list worktrees")
+        else:
+            trees = listed
+            if trees and not trees[0]["bare"]:
+                result.update(parent=trees[0]["path"], parent_name=os.path.basename(trees[0]["path"]))
+            own = next((t for t in trees if _norm_key(t["path"]) == _norm_key(repo.path)), None)
+            if own and own["locked"]:
+                result["operations_in_progress"].append("Worktree is locked: " + (own["lock_reason"] or "no reason recorded"))
+    junk, wt_bytes = find_junk(repo) if not repo.bare else ([], 0)
     items += junk
     g = None if is_wt else gc_item(repo)
     if g:
@@ -1337,11 +1544,16 @@ def scan_repo(path: str, do_fetch: bool = False, measure_worktrees: bool = True)
     for it in items:
         it["id"] = item_id(it["kind"], repo.path, it["target"])
     result["items"] = items
+    result["branches"] = [i for i in items if i["kind"] == "branch"]
+    if any(b["unpushed"] is None and repo.remote for b in result["branches"]):
+        errors.append("Could not verify branch reachability against remotes")
+    result["worktree_inventory"] = worktree_inventory(repo, trees, items)
     result["unpushed_branches"] = [{"name": b["target"], "commits": b["unpushed"]} for b in items
                                    if b["kind"] == "branch" and b.get("unpushed")]
-    result["worktrees"] = len([t for t in trees if not t["main"]])
+    result["worktrees"] = 0 if is_wt else len([t for t in trees if not t["main"]])
     result["worktree_bytes"] = wt_bytes
     result["git_bytes"] = 0 if is_wt else dir_size(repo.git_dir)
+    errors.extend(e for e in repo.read_errors if e not in errors)
     result["errors"] = errors
     result["health"] = "unknown" if errors else "ok"
     tally_bytes(result)
@@ -1410,14 +1622,57 @@ def scan_caches() -> list[dict]:
     return items
 
 
+def read_previous_sizes(path: str | None) -> dict:
+    """External snapshots are hints about size only, never evidence of safety."""
+    if not path:
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        previous = json.load(fh)
+    if not isinstance(previous, dict) or previous.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("Previous snapshot has an unsupported schema_version")
+    sizes = {}
+    for row in previous.get("repos", []):
+        for key, value in row.get("disk", {}).get("measurements", {}).items():
+            if (isinstance(value, dict) and value.get("complete") is True and
+                    type(value.get("bytes")) is int and value["bytes"] >= 0 and
+                    type(value.get("measured_at")) in (int, float) and 0 < value["measured_at"] <= now()):
+                sizes[_norm_key(key)] = value
+    return sizes
+
+
+def scan_with_sizes(path: str, previous: dict, max_age: float) -> dict:
+    context = {"previous": previous, "max_age": max_age, "measurements": {}, "walk_errors": []}
+    token = SIZE_CONTEXT.set(context)
+    try:
+        row = scan_repo(path, False, False)
+        row["disk"] = {"measurements": context["measurements"],
+                       "reused_measurements": sum(m["reused"] for m in context["measurements"].values()),
+                       "estimated": any(m["reused"] for m in context["measurements"].values()),
+                       "complete": not context["walk_errors"] and all(m["complete"] for m in context["measurements"].values()),
+                       "errors": context["walk_errors"]}
+        return row
+    finally:
+        SIZE_CONTEXT.reset(token)
+
+
 def cmd_scan(args) -> dict:
     started = now()
-    roots = [r for r in (args.roots or "").split(";") if r.strip()] or default_roots()
+    diagnostics: list[dict] = []
+    previous = read_previous_sizes(getattr(args, "previous", None))
+    roots = (getattr(args, "root", None) or []) + [r for r in (args.roots or "").split(";") if r.strip()]
+    roots = roots or default_roots()
+    exclusions = (getattr(args, "exclude_path", None) or []) + [p for p in (args.exclude or "").split(";") if p.strip()]
     if args.repo:
-        entries = [{"path": os.path.normpath(p), "kind": git_kind(p) or "repo", "source": "argument"} for p in args.repo]
+        entries = [{"path": os.path.abspath(os.path.expanduser(p)), "kind": git_kind(os.path.expanduser(p)) or "repo", "source": "argument"} for p in args.repo]
+        if args.cmd == "snapshot":
+            linked = discover([e["path"] for e in entries], 0, hints=False, exclude=exclusions, diagnostics=diagnostics)
+            entries += linked
+        excluded = [_norm_key(p) for p in exclusions]
+        entries = list({_norm_key(e["path"]): e for e in entries if not is_excluded(e["path"], excluded)}.values())
+        roots = sorted({_norm_key(p) for p in args.repo})
     else:
-        entries = discover(roots, args.depth, hints=not args.no_hints, exclude=(args.exclude or "").split(";"))
-    workers = max(1, min(8, len(entries)))
+        entries = discover(roots, args.depth, hints=not args.no_hints, exclude=exclusions, diagnostics=diagnostics)
+    workers = max(1, min(getattr(args, "workers", 8), len(entries)))
     fetch_errors: dict[str, str | None] = {}
     if args.fetch:  # fetch every main repo first, so worktrees read fresh refs
         mains = [e["path"] for e in entries if e["kind"] == "repo"]
@@ -1426,7 +1681,7 @@ def cmd_scan(args) -> dict:
                 fetch_errors[os.path.normcase(path)] = err
     results = []
     with cf.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(scan_repo, e["path"], False, False): e for e in entries}
+        futures = {pool.submit(scan_with_sizes, e["path"], previous, getattr(args, "max_size_age", 300)): e for e in entries}
         for fut in cf.as_completed(futures):
             e = futures[fut]
             try:
@@ -1450,30 +1705,103 @@ def cmd_scan(args) -> dict:
             if it["kind"] == "worktree" and it["bytes"] is None:
                 key = os.path.normcase(os.path.normpath(it["target"]))
                 it["bytes"] = row_bytes[key] if key in row_bytes else dir_size(it["target"])
+        sizes = {_norm_key(i["target"]): i["bytes"] for i in r["items"] if i["kind"] == "worktree"}
+        for tree in r.get("worktree_inventory", []):
+            if _norm_key(tree["path"]) in sizes:
+                tree["bytes"] = sizes[_norm_key(tree["path"])]
         tally_bytes(r)
-    results.sort(key=lambda r: (not r.get("attention"), (r.get("parent_name") or r["name"]).lower(), r.get("kind") == "worktree", r["name"].lower()))
+    recovery = cmd_recover(argparse.Namespace(dest=getattr(args, "dest", None), fix=False))
+    for r in results:
+        r.setdefault("id", "checkout-" + hashlib.sha256(_norm_key(r["path"]).encode("utf-8")).hexdigest()[:24])
+        r.setdefault("repository_id", None)
+        r["observed_at"] = int(now())
+        r["agent_origin"] = agent_origin(r["path"])
+        r["interrupted_operations"] = [op for op in recovery["interrupted"] if op.get("repo") and _norm_key(op["repo"]) == _norm_key(r["path"])]
+        if r["interrupted_operations"]:
+            r.setdefault("operations_in_progress", []).append("Interrupted Repo Pulse cleanup; inspect recovery advice")
+        if not r.get("disk", {}).get("complete", True):
+            r.setdefault("errors", []).append("Disk inventory is incomplete; some directories could not be read")
+            r["health"] = "unknown"
+        assess_readiness(r)
+        # Readiness must account for locks and dirty state in the default branch's holder.
+        if r["readiness"]["sync"]["state"] == "safe":
+            holders = [t for t in r.get("worktree_inventory", []) if t.get("branch") == r.get("default")]
+            for holder in holders:
+                target = next((x for x in results if _norm_key(x["path"]) == _norm_key(holder["path"])), None)
+                if holder["locked"] or not holder["exists"] or target is None or target.get("error") or target.get("dirty", {}).get("total") or target.get("health") == "unknown":
+                    r["readiness"]["sync"] = {"state": "review", "reason": "Default branch holder is locked, unavailable, dirty or unverified"}
+        if not r.get("error"):
+            r["attention"] = attention(r)
+            if r.get("operations_in_progress"):
+                r["attention"].append("Git or Repo Pulse operation needs inspection")
+            for i in r["items"]:
+                i["recovery"] = recovery_hint(i, False)
+    results.sort(key=lambda r: (not r.get("attention"), (r.get("parent_name") or r["name"]).lower(),
+                                r.get("kind") == "worktree", r["name"].lower(), _norm_key(r["path"])))
     caches = scan_caches() if args.caches else []
     ok = [r for r in results if not r.get("error")]
     # a worktree row's folders are already inside a Safe worktree item of its main repo: count them once
-    safe_trees = {os.path.normcase(os.path.normpath(i["target"])) for r in ok for i in r["items"]
-                  if i["kind"] == "worktree" and i["status"] == "safe"}
-    counted = [r for r in ok if os.path.normcase(r["path"]) not in safe_trees]
+    reclaimed = reclaimable_totals(ok, caches)
     sources: dict[str, int] = {}
     for r in results:
         sources[r["source"]] = sources.get(r["source"], 0) + 1
+    complete = not diagnostics and all(not r.get("error") and r.get("health") == "ok" for r in results)
     return {
+        "schema_version": SCHEMA_VERSION, "producer": "repo-pulse", "complete": complete,
+        "read_only": not args.fetch, "diagnostics": diagnostics, "recovery": recovery,
+        "refresh": {"git": "live", "size_max_age_seconds": getattr(args, "max_size_age", 300),
+                    "reused_measurements": sum(r.get("disk", {}).get("reused_measurements", 0) for r in results)},
         "ok": True, "version": VERSION, "scanned_at": int(now()), "roots": roots, "repos": results, "caches": caches,
         "sources": sources, "scan_ms": int((now() - started) * 1000),
         "totals": {
             "repos": len([r for r in results if r.get("kind") != "worktree"]),
             "worktrees": len([r for r in results if r.get("kind") == "worktree"]),
-            "needs_attention": len([r for r in ok if r["attention"]]),
-            "safe_bytes": sum(r["safe_bytes"] for r in counted) + sum(c["bytes"] for c in caches if c["status"] == "safe"),
-            "review_bytes": sum(r["review_bytes"] for r in counted) + sum(c["bytes"] for c in caches if c["status"] == "review"),
+            "needs_attention": len([r for r in results if r.get("error") or r.get("attention")]),
+            "safe_bytes": reclaimed["safe"], "review_bytes": reclaimed["review"],
             "worktree_bytes": sum(r["worktree_bytes"] for r in ok),
             "git_bytes": sum(r["git_bytes"] for r in ok),
         },
     }
+
+
+def reclaimable_totals(rows: list[dict], caches: list[dict]) -> dict:
+    """Count overlapping worktree/folder/cache estimates only once, across both risk bands."""
+    candidates = []
+    totals = {"safe": 0, "review": 0}
+    for row in rows:
+        for item in row["items"]:
+            if item["status"] not in totals:
+                continue
+            if item["kind"] in ("folder", "worktree"):
+                path = os.path.join(row["path"], item["target"]) if item["kind"] == "folder" else item["target"]
+                candidates.append((_norm_key(path), item))
+            else:
+                totals[item["status"]] += item["bytes"] or 0
+    candidates.extend((_norm_key(c["target"]), c) for c in caches if c["status"] in totals)
+    included = []
+    for path, item in sorted(candidates, key=lambda pair: (len(pair[0]), pair[0])):
+        if any(path == p or path.startswith(p.rstrip("\\/") + os.sep) for p in included):
+            continue
+        included.append(path)
+        totals[item["status"]] += item["bytes"] or 0
+    return totals
+
+
+def snapshot(*, roots: list[str] | None = None, repos: list[str] | None = None,
+             exclude: list[str] | None = None, hints: bool = False, workers: int = 4,
+             previous: str | None = None, max_size_age: int = 300, backup_dir: str | None = None) -> dict:
+    """Read-only Python API for Aura. No fetch, action, callback, shell or write option."""
+    argv = ["snapshot", "--workers", str(workers), "--max-size-age", str(max_size_age)]
+    for option, paths in (("--root", roots), ("--repo", repos), ("--exclude-path", exclude)):
+        for path in paths or []:
+            argv.extend((option, path))
+    if not hints:
+        argv.append("--no-hints")
+    if previous:
+        argv.extend(("--previous", previous))
+    if backup_dir:
+        argv.extend(("--dest", backup_dir))
+    return cmd_scan(build_parser().parse_args(argv))
 
 
 def _fetch_one(path: str) -> str | None:
@@ -1719,22 +2047,33 @@ def cmd_sync(args) -> dict:
     repo = Repo(args.repo)
     if not repo.remote or not repo.default:
         return {"ok": False, "error": "No remote or default branch to sync with."}
+    if repo.busy() or os.path.exists(os.path.join(repo.git_dir, "repopulse.lock")):
+        return {"ok": False, "error": "Git or Repo Pulse operation is in progress; inspect it before syncing."}
     err = repo.fetch()
     if err:
         return {"ok": False, "error": f"Fetch failed: {err}"}
     d, r = repo.default, repo.remote
     if not repo.ref_exists(f"refs/remotes/{r}/{d}") or not repo.ref_exists(f"refs/heads/{d}"):
         return {"ok": False, "error": f"{d} or {r}/{d} does not exist."}
-    out = git_ok(repo.path, "rev-list", "--left-right", "--count", f"refs/heads/{d}...refs/remotes/{r}/{d}") or "0\t0"
+    out = git_ok(repo.path, "rev-list", "--left-right", "--count", f"refs/heads/{d}...refs/remotes/{r}/{d}")
+    if out is None:
+        return {"ok": False, "error": "Could not compare default branch with remote; sync refused."}
     ahead, behind = (int(x) for x in out.split())
     steps = []
     if ahead and behind:
         return {"ok": False, "state": "diverged", "ahead": ahead, "behind": behind,
                 "error": f"{d} has diverged ({ahead} ahead, {behind} behind). Repo Pulse does not merge or rebase."}
     if behind:
-        holder = next((t for t in repo.worktrees() or [] if t.get("branch") == d and not t["bare"]), None)
+        trees = repo.worktrees()
+        if trees is None:
+            return {"ok": False, "error": "Could not list worktrees; sync refused."}
+        holder = next((t for t in trees if t.get("branch") == d and not t["bare"]), None)
         if holder:
+            if holder["locked"] or not os.path.isdir(holder["path"]):
+                return {"ok": False, "error": "Default branch worktree is locked or unavailable; sync refused."}
             st = dirty_state(holder["path"])
+            if st.get("error"):
+                return {"ok": False, "error": "Could not read default branch worktree status; sync refused."}
             c = st["counts"]
             if c.get("staged") or c.get("modified") or c.get("conflicted"):
                 return {"ok": False, "error": f"{d} is checked out with uncommitted changes in {holder['path']}. Back up or commit first."}
@@ -2541,32 +2880,65 @@ def render_text(result: dict) -> str:
     for r in result["repos"]:
         label = ("  wt " if r.get("kind") == "worktree" else "") + r["name"]
         if r.get("error"):
-            lines.append(f"[!] {label}  {r['path']}\n      {r['error']}")
+            lines.append(f"[!] {label}  {r['path']}\n      {r['error']}\n      Resolve access/metadata errors and refresh before acting.")
             continue
         mark = "[!]" if r["attention"] else "[ok]"
         lines.append(f"{mark:4} {label}  ({r.get('branch') or 'detached'})  {r['path']}")
+        if r.get("readiness"):
+            states = r["readiness"]
+            lines.append(f"      risk={r['risk']['level']} resume={states['resume']['state']} "
+                         f"sync={states['sync']['state']} clean={states['clean']['state']}")
         lines += [f"      - {n}" for n in r["attention"]]
+        lines += [f"      Guidance: {guidance}" for guidance in dict.fromkeys(
+            f["guidance"] for f in r.get("risk", {}).get("findings", []))]
         for it in sorted((i for i in r["items"] if i["status"] != "keep"), key=lambda i: -i["bytes"]):
             lines.append(f"      {it['status']:6} {it['kind']:8} {human(it['bytes']):>9}  {it['target']}  [{it['id']}]")
     if result.get("caches"):
         lines += ["", "Global caches:"]
         lines += [f"      {c['status']:6} {c['label']:20} {human(c['bytes']):>9}  {c['target']}  [{c['id']}]" for c in result["caches"]]
+    if not result.get("complete", True):
+        lines.append("PARTIAL: inspect diagnostics and unknown repositories before making decisions.")
+        lines += [f"      {d['path']}: {d['message']}" for d in result.get("diagnostics", [])]
     return "\n".join(lines)
 
 
+class ContractParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError(message)
+
+
+def bounded_int(low: int, high: int):
+    def parse(value: str) -> int:
+        n = int(value)
+        if not low <= n <= high:
+            raise argparse.ArgumentTypeError(f"must be between {low} and {high}")
+        return n
+    return parse
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="repopulse", description="Repo Pulse core")
+    p = ContractParser(prog="repopulse", description="Repo Pulse core")
     p.add_argument("--version", action="version", version=VERSION)
     sub = p.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("scan", help="Read-only scan")
-    s.add_argument("--roots", help="Semicolon-separated folders to search")
-    s.add_argument("--repo", action="append", help="Scan only this repo (repeatable)")
-    s.add_argument("--depth", type=int, default=MAX_DEPTH)
-    s.add_argument("--fetch", action="store_true", help="git fetch --prune first (updates remote-tracking refs only)")
-    s.add_argument("--caches", action="store_true", help="Include global package caches")
-    s.add_argument("--no-hints", action="store_true", help="Ignore folders known to Claude Code, Codex, VS Code and JetBrains")
-    s.add_argument("--exclude", help="Semicolon-separated folders never to search or report")
-    s.add_argument("--text", action="store_true", help="Print a readable report instead of JSON")
+    for name, help_text in (("scan", "Scan; optionally fetch"), ("snapshot", "Read-only versioned snapshot for Aura")):
+        s = sub.add_parser(name, help=help_text)
+        s.add_argument("--roots", help="Semicolon-separated folders to search")
+        s.add_argument("--root", action="append", help="Literal scan root (repeatable; supports semicolons in paths)")
+        s.add_argument("--repo", action="append", help="Repository path (repeatable; snapshot includes its linked worktrees)")
+        s.add_argument("--depth", type=bounded_int(0, 64), default=MAX_DEPTH)
+        s.set_defaults(fetch=False)
+        if name == "scan":
+            s.add_argument("--fetch", action="store_true", help="git fetch --prune first (updates remote-tracking refs only)")
+        s.add_argument("--caches", action="store_true", help="Include global package caches")
+        s.add_argument("--no-hints", action="store_true", help="Ignore tool-history discovery")
+        s.add_argument("--exclude", help="Semicolon-separated folders never to search or report")
+        s.add_argument("--exclude-path", action="append", help="Literal excluded folder (repeatable)")
+        s.add_argument("--text", action="store_true", help="Print a readable report instead of JSON")
+        s.add_argument("--json", action="store_true", help="Print JSON (the default)")
+        s.add_argument("--previous", help="Previous snapshot; reuse only bounded-age disk-size estimates")
+        s.add_argument("--max-size-age", type=bounded_int(0, 3600), default=300, help="Size-estimate TTL in seconds; 0 forces measurement")
+        s.add_argument("--workers", type=bounded_int(1, 16), default=8, help="Bounded concurrent repository reads")
+        s.add_argument("--dest", help="Read operation history in this backup root; never create it")
     b = sub.add_parser("backup", help="Copy dirty files and bundle unpushed commits")
     b.add_argument("--repo", required=True)
     b.add_argument("--dest")
@@ -2622,22 +2994,26 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(json.dumps({"ok": False, "error": f"Repo Pulse needs Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer "
                                                            f"(this is {sys.version.split()[0]})."}) + "\n")
         return 1
-    args = build_parser().parse_args(argv)
-    handlers = {"scan": cmd_scan, "backup": cmd_backup, "sync": cmd_sync, "clean": cmd_clean, "diff": cmd_diff,
+    handlers = {"scan": cmd_scan, "snapshot": cmd_scan, "backup": cmd_backup, "sync": cmd_sync, "clean": cmd_clean, "diff": cmd_diff,
                 "verify": cmd_verify, "restore": cmd_restore, "undo": cmd_undo, "ops": cmd_ops,
                 "recover": cmd_recover, "backups": cmd_backups}
+    args = None
     try:
+        args = build_parser().parse_args(argv)
+        if getattr(args, "text", False) and getattr(args, "json", False):
+            raise ValueError("--text and --json are mutually exclusive")
         result = handlers[args.cmd](args)
     except Exception as exc:
-        result = {"ok": False, "error": str(exc)}
-    if getattr(args, "text", False):
+        result = {"ok": False, "schema_version": SCHEMA_VERSION, "complete": False, "error": str(exc)}
+    exit_code = 1 if not result.get("ok") else 2 if args and args.cmd == "snapshot" and not result.get("complete") else 0
+    if getattr(args, "text", False) and not getattr(args, "json", False):
         sys.stdout.buffer.write(render_text(result).encode(sys.stdout.encoding or "utf-8", "replace") + b"\n")
         sys.stdout.buffer.flush()
-        return 0 if result.get("ok") else 1
+        return exit_code
     data = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     sys.stdout.buffer.write(data + b"\n")
     sys.stdout.buffer.flush()
-    return 0 if result.get("ok") else 1
+    return exit_code
 
 
 if __name__ == "__main__":

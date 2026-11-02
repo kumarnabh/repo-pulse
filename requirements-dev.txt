@@ -1,0 +1,2 @@
+# Only for validating the published JSON Schema in tests; core has no dependencies.
+jsonschema>=4.23,<5

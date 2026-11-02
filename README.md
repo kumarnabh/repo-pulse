@@ -71,6 +71,8 @@ The core is one standard-library Python file and works without the widget, on Wi
 python repopulse.py scan --text                     # readable report: every fixed drive + tool history + worktrees
 python repopulse.py scan --fetch --roots "D:\Code" --exclude "D:\Code\archive"
 python repopulse.py scan --roots ~/code --no-hints  # JSON, only this folder
+python repopulse.py snapshot --root ~/code --no-hints --json  # versioned, strictly read-only Aura contract
+python repopulse.py snapshot --root ~/code --no-hints --previous previous.json  # reuse disk estimates; Git stays live
 python repopulse.py backup --repo "D:\Code\app"
 python repopulse.py sync   --repo "D:\Code\app" [--push]
 python repopulse.py clean  --repo "D:\Code\app" --ids ID1,ID2   # ids are shown by scan --text
@@ -84,6 +86,9 @@ python repopulse.py backups --verify    # every backup, its integrity, size and 
 ```
 
 Every command except `--text` prints one JSON object (see [SPEC.md](SPEC.md) for the fields).
+For integrations, use the [Aura contract](docs/AURA.md), [JSON Schema](docs/snapshot.schema.json)
+and [example adapter](examples/aura_client.py). Snapshots report separate resume, sync and
+cleanup readiness with risk reasons and recovery guidance; partial results exit with code 2.
 On Windows, `py -3` works in place of `python`. Outside Windows, "Recycle Bin" means
 `~/RepoPulse Backups/Trash`.
 
@@ -115,10 +120,11 @@ Build.cmd
 ## Tests
 
 ```
+python -m pip install -r requirements-dev.txt
 python -m unittest discover -s tests -v
 ```
 
-31 fixture tests run real git operations against a local bare remote, covering unpushed
+Fixture tests run real git operations against a local bare remote, covering unpushed
 commits, stale fetches, squash-merged branches, dirty, locked or secret-holding worktrees, tracked
 files inside junk folders, and changes made between scan and cleanup. See [TESTING.md](TESTING.md)
 for the manual Windows checklist.

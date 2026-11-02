@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Versioned read-only snapshot CLI/Python API for Aura, JSON Schema and example adapter.
+- Stable checkout/shared-repository IDs, complete remote/branch/worktree facts,
+  explicit partial results, risk findings and resume/sync/cleanup readiness.
+- Bounded-age incremental disk estimates with live Git reclassification,
+  overlapping-size deduplication and agent worktree orphan candidates.
+- Correct unusual worktree paths, linked-only discovery, broken-root identity,
+  failed/multiple-remote fetch freshness and conservative sync error handling.
+- Contract and adversarial fixture regressions; existing backup, restore, undo
+  and explicit cleanup mechanisms retained.
+
 All notable changes. Versions follow [semantic versioning](https://semver.org/); releases are on
 [GitHub](https://github.com/kumarnabh/repo-pulse/releases).
 

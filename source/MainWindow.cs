@@ -366,6 +366,14 @@ public sealed class MainWindow : Window
                    (fetched == null ? "never fetched" : $"fetched {(fetched < 1 ? "<1 h" : $"{fetched:0} h")} ago");
         body.Children.Add(T(meta, 11, Dim));
         body.Children.Add(T(path, 11, Dim));
+        if (r.Has("readiness"))
+        {
+            var ready = r.O("readiness");
+            body.Children.Add(T($"Resume: {ready.O("resume").S("state")} · Sync: {ready.O("sync").S("state")} · " +
+                                $"Clean candidates: {ready.O("clean").S("state")} · Risk: {r.O("risk").S("level")}", 11, Dim, wrap: true));
+            foreach (var finding in r.O("risk").A("findings"))
+                body.Children.Add(T(finding.S("guidance"), 11, Dim, wrap: true));
+        }
         foreach (var note in r.EnumerateNotes())
             body.Children.Add(T("• " + note, 12, Br("#F5C86B"), wrap: true));
 

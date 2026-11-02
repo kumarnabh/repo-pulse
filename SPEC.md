@@ -26,6 +26,7 @@ automatic cleanup, anything requiring administrator rights.
 Core commands:
 
 ```
+repopulse.py snapshot --root PATH [--repo PATH] [--no-hints] [--json | --text] [--previous FILE] [--max-size-age SECONDS] [--workers N]
 repopulse.py scan    --roots "D:\Code;C:\Users\me\source" [--exclude "D:\Code\old"] [--fetch] [--caches] [--no-hints] [--text]
 repopulse.py backup  --repo PATH [--dest DIR]
 repopulse.py sync    --repo PATH [--push]
@@ -38,6 +39,11 @@ repopulse.py ops     [--limit N]
 repopulse.py recover [--fix]
 repopulse.py backups [--verify] [--prune-days N [--apply]]
 ```
+
+`scan` and `snapshot` share the additive [v1 JSON Schema](docs/snapshot.schema.json).
+The [Aura integration contract](docs/AURA.md) specifies identity, partial results,
+readiness, risk, incremental size estimates, and exit codes. `snapshot` accepts no
+mutation options. The Python `repopulse.snapshot(...)` API is also read-only.
 
 `restore` never moves an existing branch and never overwrites a file with uncommitted changes unless
 `--overwrite` is given (the current version is first saved to `pre-restore-<time>/` in the backup).
@@ -60,8 +66,10 @@ successful and failed fetch per remote, written by `--fetch` and `sync`) and `<g
 `<backup folder>/operations.jsonl`, with the recovery command where there is one.
 
 `scan` never changes anything, except `--fetch`, which runs
-`git fetch --prune --no-tags origin` on every main repository before scanning (it updates only
+`git fetch --prune --no-tags <preferred remote>` on every main repository before scanning (it updates only
 remote-tracking refs; repositories without a remote are skipped, not reported as failures).
+The preferred remote is `origin`, else the first configured remote. Fetch freshness
+is per remote; shared FETCH_HEAD is a fallback only for a single-remote repository.
 `--no-hints` skips tool-history discovery. `--exclude` lists folders that are never walked or reported.
 `--text` prints a readable report instead of JSON.
 
@@ -170,7 +178,8 @@ The working tree is not modified.
   in a clean worktree, `git merge --ff-only`; if not checked out, `git fetch . origin/main:main`.
   Git refuses non-fast-forward updates in both paths.
 - `--push`: `git push origin <branch>` without force, only when ahead and not behind.
-- Diverged or dirty: no action; the UI shows the diff and the counts.
+- Diverged, unreadable comparison/status, locked holder or an interrupted Git/Repo
+  Pulse operation: no action; inspect the reported reason before retrying.
 
 ## Repository discovery
 
